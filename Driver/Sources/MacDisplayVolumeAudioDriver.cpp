@@ -31,6 +31,7 @@ constexpr AudioObjectPropertySelector kPropertyTargetUID = 'tgud';
 constexpr AudioObjectPropertySelector kPropertyBufferFrameSize = 'bfsz';
 constexpr AudioObjectPropertySelector kPropertyStatus = 'stat';
 constexpr AudioObjectPropertySelector kPropertyReset = 'rset';
+constexpr UInt64 kChangeActionSetSampleRate = 1;
 
 constexpr UInt32 kChannels = 2;
 constexpr UInt32 kBytesPerChannel = sizeof(Float32);
@@ -39,8 +40,8 @@ constexpr UInt32 kRingCapacityFrames = 8192;
 constexpr UInt32 kMaxQueuedFrames = 2048;
 constexpr UInt32 kDefaultBufferFrames = 128;
 constexpr UInt32 kZeroTimestampPeriodFrames = 16384;
-constexpr int64_t kTargetStartDelayNanos = 200000000;
 constexpr int64_t kTargetRecoveryDelayNanos = 1000000000;
+constexpr int64_t kTargetIdleStopDelayNanos = 2000000000;
 constexpr UInt64 kTargetStallRecoveryNanos = 1000000000;
 constexpr Float64 kDefaultSampleRate = 48000.0;
 constexpr Float32 kMinDB = -60.0f;
@@ -48,6 +49,7 @@ constexpr Float32 kMaxDB = 0.0f;
 
 AudioServerPlugInHostRef gHost = nullptr;
 UInt32 gRefCount = 1;
+extern AudioServerPlugInDriverRef gDriverRef;
 
 std::mutex gStateMutex;
 dispatch_queue_t gTargetQueue = dispatch_queue_create("tech.soit.MacDisplayVolume.target", DISPATCH_QUEUE_SERIAL);
@@ -57,9 +59,11 @@ std::atomic<UInt64> gWritePosition { 0 };
 std::atomic<UInt32> gRunningClients { 0 };
 std::atomic<UInt32> gPreferredBufferFrames { kDefaultBufferFrames };
 std::atomic<Float64> gSampleRate { kDefaultSampleRate };
+std::atomic<Float64> gRequestedSampleRate { kDefaultSampleRate };
 std::atomic<Float32> gVolumeLeft { 1.0f };
 std::atomic<Float32> gVolumeRight { 1.0f };
 std::atomic_bool gMute { false };
+std::atomic_bool gStreamOutputActive { true };
 std::atomic_bool gRelayPriming { true };
 bool gBoxAcquired = true;
 std::atomic<UInt64> gZeroTimestampSeed { 1 };
@@ -70,6 +74,7 @@ std::atomic<UInt64> gFramesRead { 0 };
 std::atomic<UInt64> gDroppedFrames { 0 };
 std::atomic<UInt64> gUnderruns { 0 };
 std::atomic<UInt64> gTargetStartGeneration { 0 };
+std::atomic<UInt64> gTargetStopGeneration { 0 };
 std::atomic_bool gTargetActive { false };
 std::atomic_bool gTargetRecoveryScheduled { false };
 std::atomic<UInt64> gLastTargetIOHostTime { 0 };
@@ -137,6 +142,35 @@ bool StringValuesEqual(CFStringRef lhs, CFStringRef rhs) {
 
 bool IsSupportedTargetSampleRate(Float64 sampleRate) {
     return std::abs(sampleRate - kDefaultSampleRate) < 1.0;
+}
+
+bool HasSupportedStreamShape(const AudioStreamBasicDescription &format) {
+    return format.mFormatID == kAudioFormatLinearPCM &&
+           format.mFormatFlags == static_cast<AudioFormatFlags>(
+               static_cast<UInt32>(kAudioFormatFlagIsFloat) |
+               static_cast<UInt32>(kAudioFormatFlagsNativeEndian) |
+               static_cast<UInt32>(kAudioFormatFlagIsPacked)
+           ) &&
+           format.mBytesPerPacket == kBytesPerFrame &&
+           format.mFramesPerPacket == 1 &&
+           format.mBytesPerFrame == kBytesPerFrame &&
+           format.mChannelsPerFrame == kChannels &&
+           format.mBitsPerChannel == kBytesPerChannel * 8;
+}
+
+bool HasValidSampleTime(const AudioTimeStamp &timeStamp) {
+    return (timeStamp.mFlags & kAudioTimeStampSampleTimeValid) != 0;
+}
+
+bool IsLateWriteMix(const AudioServerPlugInIOCycleInfo *cycleInfo, UInt32 frameCount) {
+    if (cycleInfo == nullptr ||
+        !HasValidSampleTime(cycleInfo->mCurrentTime) ||
+        !HasValidSampleTime(cycleInfo->mOutputTime)) {
+        return false;
+    }
+
+    return cycleInfo->mCurrentTime.mSampleTime >
+           cycleInfo->mOutputTime.mSampleTime + static_cast<Float64>(frameCount);
 }
 
 CFUUIDRef CreateFactoryUUID() {
@@ -675,9 +709,14 @@ void CancelScheduledTargetStart() {
     gTargetStartGeneration.fetch_add(1, std::memory_order_acq_rel);
 }
 
+void CancelScheduledTargetStop() {
+    gTargetStopGeneration.fetch_add(1, std::memory_order_acq_rel);
+}
+
 void ScheduleStartTargetDevice() {
+    CancelScheduledTargetStop();
     UInt64 generation = gTargetStartGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kTargetStartDelayNanos), gTargetQueue, ^{
+    dispatch_async(gTargetQueue, ^{
         if (gTargetStartGeneration.load(std::memory_order_acquire) != generation) {
             return;
         }
@@ -690,13 +729,30 @@ void ScheduleStartTargetDevice() {
 
 void ScheduleStopTargetDevice() {
     CancelScheduledTargetStart();
+    CancelScheduledTargetStop();
     dispatch_async(gTargetQueue, ^{
         StopTargetDevice();
     });
 }
 
+void ScheduleIdleStopTargetDevice() {
+    CancelScheduledTargetStart();
+    UInt64 generation = gTargetStopGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kTargetIdleStopDelayNanos), gTargetQueue, ^{
+        if (gTargetStopGeneration.load(std::memory_order_acquire) != generation) {
+            return;
+        }
+        if (gRunningClients.load(std::memory_order_acquire) > 0) {
+            return;
+        }
+        StopTargetDevice();
+        Notify(kObjectIDDevice, kPropertyStatus);
+    });
+}
+
 void ScheduleRestartTargetDevice(bool shouldStartTarget) {
     CancelScheduledTargetStart();
+    CancelScheduledTargetStop();
     dispatch_async(gTargetQueue, ^{
         StopTargetDevice();
         {
@@ -927,8 +983,15 @@ HRESULT QueryInterface(void *driver, REFIID uuid, LPVOID *interface) {
     if (driver == nullptr || interface == nullptr) {
         return E_POINTER;
     }
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
 
     CFUUIDRef requestedUUID = CFUUIDCreateFromUUIDBytes(nullptr, uuid);
+    if (requestedUUID == nullptr) {
+        *interface = nullptr;
+        return E_NOINTERFACE;
+    }
     if (CFEqual(requestedUUID, kAudioServerPlugInDriverInterfaceUUID) || CFEqual(requestedUUID, IUnknownUUID)) {
         *interface = driver;
         gRefCount += 1;
@@ -955,8 +1018,12 @@ ULONG Release(void *) {
     return gRefCount;
 }
 
-OSStatus Initialize(AudioServerPlugInDriverRef, AudioServerPlugInHostRef host) {
+OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef host) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
     gHost = host;
+    gRequestedSampleRate.store(kDefaultSampleRate, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
         FlushRingLocked();
@@ -965,42 +1032,90 @@ OSStatus Initialize(AudioServerPlugInDriverRef, AudioServerPlugInHostRef host) {
     return noErr;
 }
 
-OSStatus CreateDevice(AudioServerPlugInDriverRef, CFDictionaryRef, const AudioServerPlugInClientInfo *, AudioObjectID *) {
+OSStatus CreateDevice(AudioServerPlugInDriverRef driver, CFDictionaryRef, const AudioServerPlugInClientInfo *, AudioObjectID *) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
     return kAudioHardwareUnsupportedOperationError;
 }
 
-OSStatus DestroyDevice(AudioServerPlugInDriverRef, AudioObjectID) {
+OSStatus DestroyDevice(AudioServerPlugInDriverRef driver, AudioObjectID) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
     return kAudioHardwareUnsupportedOperationError;
 }
 
-OSStatus AddDeviceClient(AudioServerPlugInDriverRef, AudioObjectID, const AudioServerPlugInClientInfo *) {
-    return noErr;
-}
-
-OSStatus RemoveDeviceClient(AudioServerPlugInDriverRef, AudioObjectID, const AudioServerPlugInClientInfo *) {
-    return noErr;
-}
-
-OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID, UInt64 action, void *) {
-    std::lock_guard<std::mutex> lock(gStateMutex);
-    if (action > 0) {
-        if (static_cast<Float64>(action) != kDefaultSampleRate) {
-            return kAudioHardwareIllegalOperationError;
-        }
-        gSampleRate.store(kDefaultSampleRate, std::memory_order_release);
-        FlushRingLocked();
+OSStatus AddDeviceClient(AudioServerPlugInDriverRef driver, AudioObjectID deviceID, const AudioServerPlugInClientInfo *) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (deviceID != kObjectIDDevice) {
+        return kAudioHardwareBadObjectError;
     }
     return noErr;
 }
 
-OSStatus AbortDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID, UInt64, void *) {
+OSStatus RemoveDeviceClient(AudioServerPlugInDriverRef driver, AudioObjectID deviceID, const AudioServerPlugInClientInfo *) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (deviceID != kObjectIDDevice) {
+        return kAudioHardwareBadObjectError;
+    }
     return noErr;
 }
 
-Boolean HasProperty(AudioServerPlugInDriverRef,
+OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef driver, AudioObjectID deviceID, UInt64 action, void *) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (deviceID != kObjectIDDevice) {
+        return kAudioHardwareBadObjectError;
+    }
+
+    switch (action) {
+    case 0:
+        return noErr;
+    case kChangeActionSetSampleRate: {
+        Float64 requestedSampleRate = gRequestedSampleRate.load(std::memory_order_acquire);
+        if (!IsSupportedTargetSampleRate(requestedSampleRate)) {
+            return kAudioHardwareIllegalOperationError;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gSampleRate.store(requestedSampleRate, std::memory_order_release);
+            FlushRingLocked();
+        }
+        Notify(kObjectIDDevice, kPropertyStatus);
+        return noErr;
+    }
+    default:
+        return kAudioHardwareIllegalOperationError;
+    }
+}
+
+OSStatus AbortDeviceConfigurationChange(AudioServerPlugInDriverRef driver, AudioObjectID deviceID, UInt64 action, void *) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (deviceID != kObjectIDDevice) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (action == kChangeActionSetSampleRate) {
+        gRequestedSampleRate.store(gSampleRate.load(std::memory_order_acquire), std::memory_order_release);
+    }
+    return noErr;
+}
+
+Boolean HasProperty(AudioServerPlugInDriverRef driver,
                     AudioObjectID objectID,
                     pid_t,
                     const AudioObjectPropertyAddress *address) {
+    if (driver != gDriverRef) {
+        return false;
+    }
     if (address == nullptr) {
         return false;
     }
@@ -1022,12 +1137,15 @@ Boolean HasProperty(AudioServerPlugInDriverRef,
     return false;
 }
 
-OSStatus IsPropertySettable(AudioServerPlugInDriverRef,
+OSStatus IsPropertySettable(AudioServerPlugInDriverRef driver,
                             AudioObjectID objectID,
                             pid_t,
                             const AudioObjectPropertyAddress *address,
                             Boolean *isSettable) {
-    if (address == nullptr || isSettable == nullptr || !HasProperty(nullptr, objectID, 0, address)) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (address == nullptr || isSettable == nullptr || !HasProperty(driver, objectID, 0, address)) {
         LogUnknownProperty("IsPropertySettable", objectID, address);
         return kAudioHardwareUnknownPropertyError;
     }
@@ -1066,14 +1184,17 @@ OSStatus IsPropertySettable(AudioServerPlugInDriverRef,
     return noErr;
 }
 
-OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef,
+OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef driver,
                              AudioObjectID objectID,
                              pid_t clientPID,
                              const AudioObjectPropertyAddress *address,
                              UInt32,
                              const void *,
                              UInt32 *outDataSize) {
-    if (address == nullptr || outDataSize == nullptr || !HasProperty(nullptr, objectID, clientPID, address)) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (address == nullptr || outDataSize == nullptr || !HasProperty(driver, objectID, clientPID, address)) {
         LogUnknownProperty("GetPropertyDataSize", objectID, address);
         return kAudioHardwareUnknownPropertyError;
     }
@@ -1153,7 +1274,7 @@ OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef,
     }
 }
 
-OSStatus GetPropertyData(AudioServerPlugInDriverRef,
+OSStatus GetPropertyData(AudioServerPlugInDriverRef driver,
                          AudioObjectID objectID,
                          pid_t clientPID,
                          const AudioObjectPropertyAddress *address,
@@ -1162,7 +1283,10 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
                          UInt32 inDataSize,
                          UInt32 *outDataSize,
                          void *outData) {
-    if (address == nullptr || outDataSize == nullptr || outData == nullptr || !HasProperty(nullptr, objectID, clientPID, address)) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (address == nullptr || outDataSize == nullptr || outData == nullptr || !HasProperty(driver, objectID, clientPID, address)) {
         LogUnknownProperty("GetPropertyData", objectID, address);
         return kAudioHardwareUnknownPropertyError;
     }
@@ -1337,9 +1461,13 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
     case kAudioDevicePropertyDeviceIsAlive:
     case kAudioDevicePropertyDeviceCanBeDefaultDevice:
     case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
-    case kAudioStreamPropertyIsActive:
         if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
         *static_cast<UInt32 *>(outData) = 1;
+        *outDataSize = sizeof(UInt32);
+        return noErr;
+    case kAudioStreamPropertyIsActive:
+        if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
+        *static_cast<UInt32 *>(outData) = gStreamOutputActive.load(std::memory_order_acquire) ? 1 : 0;
         *outDataSize = sizeof(UInt32);
         return noErr;
     case kAudioDevicePropertyDeviceIsRunning:
@@ -1548,7 +1676,7 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
     }
 }
 
-OSStatus SetPropertyData(AudioServerPlugInDriverRef,
+OSStatus SetPropertyData(AudioServerPlugInDriverRef driver,
                          AudioObjectID objectID,
                          pid_t,
                          const AudioObjectPropertyAddress *address,
@@ -1556,7 +1684,10 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
                          const void *,
                          UInt32 inDataSize,
                          const void *inData) {
-    if (address == nullptr || !HasProperty(nullptr, objectID, 0, address)) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (address == nullptr || !HasProperty(driver, objectID, 0, address)) {
         LogUnknownProperty("SetPropertyData", objectID, address);
         return kAudioHardwareUnknownPropertyError;
     }
@@ -1566,10 +1697,22 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
 
     if (objectID == kObjectIDDevice) {
         switch (address->mSelector) {
-        case kAudioDevicePropertyNominalSampleRate:
+        case kAudioDevicePropertyNominalSampleRate: {
             if (inDataSize != sizeof(Float64)) { return kAudioHardwareBadPropertySizeError; }
-            if (*static_cast<const Float64 *>(inData) != kDefaultSampleRate) { return kAudioHardwareIllegalOperationError; }
+            Float64 requestedSampleRate = *static_cast<const Float64 *>(inData);
+            if (!IsSupportedTargetSampleRate(requestedSampleRate)) {
+                return kAudioHardwareIllegalOperationError;
+            }
+
+            Float64 currentSampleRate = gSampleRate.load(std::memory_order_acquire);
+            gRequestedSampleRate.store(requestedSampleRate, std::memory_order_release);
+            if (requestedSampleRate != currentSampleRate && gHost != nullptr) {
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                    gHost->RequestDeviceConfigurationChange(gHost, kObjectIDDevice, kChangeActionSetSampleRate, nullptr);
+                });
+            }
             return noErr;
+        }
         case kAudioDevicePropertyBufferFrameSize: {
             if (inDataSize != sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
             bool didChangeBufferFrames = false;
@@ -1624,12 +1767,6 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
             if (IsVirtualDeviceUID(newUID)) {
                 return kAudioHardwareIllegalOperationError;
             }
-            if (!IsEmptyString(newUID)) {
-                AudioDeviceID newTarget = DeviceIDForUID(newUID);
-                if (newTarget != kAudioObjectUnknown && !IsSupportedTargetSampleRate(DeviceNominalSampleRate(newTarget))) {
-                    return kAudioHardwareIllegalOperationError;
-                }
-            }
             {
                 std::lock_guard<std::mutex> lock(gStateMutex);
                 if (StringValuesEqual(gTargetUID, newUID)) {
@@ -1671,25 +1808,72 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
         }
     }
 
+    if (objectID == kObjectIDStreamOutput) {
+        switch (address->mSelector) {
+        case kAudioStreamPropertyIsActive:
+            if (inDataSize != sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
+            {
+                bool isActive = *static_cast<const UInt32 *>(inData) != 0;
+                bool didChange = gStreamOutputActive.exchange(isActive, std::memory_order_acq_rel) != isActive;
+                if (didChange) {
+                    Notify(kObjectIDStreamOutput, kAudioStreamPropertyIsActive);
+                }
+            }
+            return noErr;
+        case kAudioStreamPropertyVirtualFormat:
+        case kAudioStreamPropertyPhysicalFormat: {
+            if (inDataSize != sizeof(AudioStreamBasicDescription)) { return kAudioHardwareBadPropertySizeError; }
+            const auto &requestedFormat = *static_cast<const AudioStreamBasicDescription *>(inData);
+            if (!HasSupportedStreamShape(requestedFormat)) {
+                return kAudioDeviceUnsupportedFormatError;
+            }
+            if (!IsSupportedTargetSampleRate(requestedFormat.mSampleRate)) {
+                return kAudioHardwareIllegalOperationError;
+            }
+
+            Float64 currentSampleRate = gSampleRate.load(std::memory_order_acquire);
+            gRequestedSampleRate.store(requestedFormat.mSampleRate, std::memory_order_release);
+            if (requestedFormat.mSampleRate != currentSampleRate && gHost != nullptr) {
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                    gHost->RequestDeviceConfigurationChange(gHost, kObjectIDDevice, kChangeActionSetSampleRate, nullptr);
+                });
+            }
+            return noErr;
+        }
+        default:
+            return kAudioHardwareUnknownPropertyError;
+        }
+    }
+
     if (objectID == kObjectIDBox && address->mSelector == kAudioBoxPropertyAcquired) {
         if (inDataSize != sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
         bool acquired = *static_cast<const UInt32 *>(inData) != 0;
         bool shouldStopTarget = false;
+        bool shouldRestartTarget = false;
         {
             std::lock_guard<std::mutex> lock(gStateMutex);
+            if (gBoxAcquired == acquired) {
+                return noErr;
+            }
             gBoxAcquired = acquired;
-            if (!gBoxAcquired) {
+            if (!acquired) {
                 FlushRingLocked();
                 shouldStopTarget = true;
+            } else if (gRunningClients.load(std::memory_order_acquire) > 0) {
+                FlushRingLocked();
+                shouldRestartTarget = true;
             }
         }
-        if (shouldStopTarget) {
+        if (shouldRestartTarget) {
+            ScheduleRestartTargetDevice(true);
+        } else if (shouldStopTarget) {
             ScheduleStopTargetDevice();
         }
         Notify(kObjectIDBox, kAudioBoxPropertyAcquired);
         Notify(kObjectIDBox, kAudioBoxPropertyDeviceList);
         Notify(kObjectIDPlugIn, kAudioPlugInPropertyDeviceList);
         Notify(kObjectIDPlugIn, kAudioObjectPropertyOwnedObjects);
+        Notify(kObjectIDDevice, kPropertyStatus);
         return noErr;
     }
 
@@ -1725,7 +1909,10 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
     return kAudioHardwareUnknownPropertyError;
 }
 
-OSStatus StartIO(AudioServerPlugInDriverRef, AudioObjectID deviceID, UInt32) {
+OSStatus StartIO(AudioServerPlugInDriverRef driver, AudioObjectID deviceID, UInt32) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
     if (deviceID != kObjectIDDevice) {
         return kAudioHardwareBadDeviceError;
     }
@@ -1741,8 +1928,9 @@ OSStatus StartIO(AudioServerPlugInDriverRef, AudioObjectID deviceID, UInt32) {
         runningClients += 1;
         gRunningClients.store(runningClients, std::memory_order_release);
         if (runningClients == 1) {
+            CancelScheduledTargetStop();
             FlushRingLocked();
-            shouldStartTarget = true;
+            shouldStartTarget = !gTargetActive.load(std::memory_order_acquire);
         }
     }
 
@@ -1754,7 +1942,10 @@ OSStatus StartIO(AudioServerPlugInDriverRef, AudioObjectID deviceID, UInt32) {
     return noErr;
 }
 
-OSStatus StopIO(AudioServerPlugInDriverRef, AudioObjectID deviceID, UInt32) {
+OSStatus StopIO(AudioServerPlugInDriverRef driver, AudioObjectID deviceID, UInt32) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
     if (deviceID != kObjectIDDevice) {
         return kAudioHardwareBadDeviceError;
     }
@@ -1776,19 +1967,25 @@ OSStatus StopIO(AudioServerPlugInDriverRef, AudioObjectID deviceID, UInt32) {
     }
 
     if (shouldStopTarget) {
-        ScheduleStopTargetDevice();
+        ScheduleIdleStopTargetDevice();
     }
 
     Notify(kObjectIDDevice, kAudioDevicePropertyDeviceIsRunning);
     return noErr;
 }
 
-OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef,
-                          AudioObjectID,
+OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef driver,
+                          AudioObjectID deviceID,
                           UInt32,
                           Float64 *sampleTime,
                           UInt64 *hostTime,
                           UInt64 *seed) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (deviceID != kObjectIDDevice) {
+        return kAudioHardwareBadDeviceError;
+    }
     UInt64 currentHostTime = AudioGetCurrentHostTime();
     UInt64 anchorHostTime = gAnchorHostTime.load(std::memory_order_acquire);
     Float64 anchorSampleTime = gAnchorSampleTime.load(std::memory_order_acquire);
@@ -1816,12 +2013,18 @@ OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef,
     return noErr;
 }
 
-OSStatus WillDoIOOperation(AudioServerPlugInDriverRef,
-                           AudioObjectID,
+OSStatus WillDoIOOperation(AudioServerPlugInDriverRef driver,
+                           AudioObjectID deviceID,
                            UInt32,
                            UInt32 operationID,
                            Boolean *willDo,
                            Boolean *willDoInPlace) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (deviceID != kObjectIDDevice) {
+        return kAudioHardwareBadDeviceError;
+    }
     if (willDo != nullptr) {
         *willDo = operationID == kAudioServerPlugInIOOperationWriteMix;
     }
@@ -1831,39 +2034,60 @@ OSStatus WillDoIOOperation(AudioServerPlugInDriverRef,
     return noErr;
 }
 
-OSStatus BeginIOOperation(AudioServerPlugInDriverRef,
-                          AudioObjectID,
+OSStatus BeginIOOperation(AudioServerPlugInDriverRef driver,
+                          AudioObjectID deviceID,
                           UInt32,
                           UInt32,
                           UInt32,
                           const AudioServerPlugInIOCycleInfo *) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (deviceID != kObjectIDDevice) {
+        return kAudioHardwareBadDeviceError;
+    }
     return noErr;
 }
 
-OSStatus DoIOOperation(AudioServerPlugInDriverRef,
+OSStatus DoIOOperation(AudioServerPlugInDriverRef driver,
                        AudioObjectID deviceID,
                        AudioObjectID streamID,
                        UInt32,
                        UInt32 operationID,
                        UInt32 frameCount,
-                       const AudioServerPlugInIOCycleInfo *,
+                       const AudioServerPlugInIOCycleInfo *cycleInfo,
                        void *ioMainBuffer,
                        void *) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
     if (deviceID != kObjectIDDevice || streamID != kObjectIDStreamOutput) {
         return kAudioHardwareBadObjectError;
     }
-    if (operationID == kAudioServerPlugInIOOperationWriteMix && ioMainBuffer != nullptr) {
+    if (operationID != kAudioServerPlugInIOOperationWriteMix) {
+        return kAudioHardwareIllegalOperationError;
+    }
+    if (IsLateWriteMix(cycleInfo, frameCount)) {
+        return kAudioHardwareUnspecifiedError;
+    }
+    if (ioMainBuffer != nullptr) {
         StoreFrames(static_cast<const Float32 *>(ioMainBuffer), frameCount);
     }
     return noErr;
 }
 
-OSStatus EndIOOperation(AudioServerPlugInDriverRef,
-                        AudioObjectID,
+OSStatus EndIOOperation(AudioServerPlugInDriverRef driver,
+                        AudioObjectID deviceID,
                         UInt32,
                         UInt32,
                         UInt32,
                         const AudioServerPlugInIOCycleInfo *) {
+    if (driver != gDriverRef) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (deviceID != kObjectIDDevice) {
+        return kAudioHardwareBadDeviceError;
+    }
     return noErr;
 }
 

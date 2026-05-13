@@ -86,6 +86,18 @@ Settings to control the volume of `Mac Display Volume`.
 - If CoreAudio gets into a bad state, use **Restart coreaudiod** or reboot the
   Mac.
 
+## Driver Smoke Test
+
+Run the HAL driver smoke test inside a disposable macOS VM:
+
+```sh
+Scripts/vm-smoke-test.sh
+```
+
+The script builds and installs the driver, restarts `coreaudiod`, verifies
+`system_profiler` enumeration and `coreaudiod` bundle loading, runs
+`DriverProbe`, and uninstalls the driver by default.
+
 ## Uninstall
 
 ```sh

@@ -13,6 +13,10 @@ let package = Package(
             name: "DisplayVolume",
             targets: ["DisplayVolumeApp"]
         ),
+        .executable(
+            name: "DriverProbe",
+            targets: ["DriverProbe"]
+        ),
     ],
     targets: [
         .executableTarget(
@@ -26,6 +30,11 @@ let package = Package(
         .target(
             name: "DisplayVolumeCore",
             path: "Sources/DisplayVolumeCore"
+        ),
+        .executableTarget(
+            name: "DriverProbe",
+            dependencies: ["DisplayVolumeCore"],
+            path: "Tools/DriverProbe"
         ),
         .testTarget(
             name: "DisplayVolumeCoreTests",

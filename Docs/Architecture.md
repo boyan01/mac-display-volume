@@ -56,6 +56,16 @@ The driver must avoid blocking the audio render path. Ring-buffer state used by
 IO callbacks is represented with atomics, while configuration changes and target
 device start/stop are serialized outside the realtime callback path.
 
+Standard HAL sample-rate and stream-format writes follow the
+`RequestDeviceConfigurationChange` / `PerformDeviceConfigurationChange` flow.
+The current driver still supports only `48 kHz`, but it now validates standard
+HAL writes consistently before applying the change on the configuration-change
+path.
+
+The driver also validates IO entry points and treats late `WriteMix` cycles as
+failed work instead of accepting audio that already missed the HAL output
+deadline.
+
 ## Driver Custom Properties
 
 The app talks to the driver through device-scoped custom properties:

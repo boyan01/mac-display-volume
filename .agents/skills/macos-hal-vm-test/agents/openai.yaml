@@ -1,0 +1,4 @@
+interface:
+  display_name: "macOS HAL VM Test"
+  short_description: "Run VM smoke tests for the HAL audio driver"
+  default_prompt: "Use $macos-hal-vm-test to install the driver in a Tart macOS VM and verify playback."
