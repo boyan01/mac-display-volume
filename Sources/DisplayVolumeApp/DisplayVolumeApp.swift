@@ -16,9 +16,9 @@ struct DisplayVolumeApp: App {
         WindowGroup("Mac Display Volume", id: "main") {
             ContentView()
                 .environment(store)
-                .frame(minWidth: 640, minHeight: 520)
+                .frame(minWidth: 700, minHeight: 560)
         }
-        .defaultSize(width: 720, height: 600)
+        .defaultSize(width: 820, height: 640)
         .windowResizability(.contentMinSize)
     }
 }
