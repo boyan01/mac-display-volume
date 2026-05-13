@@ -1,97 +1,111 @@
 # Mac Display Volume
 
-Mac Display Volume is a small macOS virtual audio output for displays that expose
-fixed HDMI/DisplayPort/USB-C audio volume to macOS.
+[中文文档](README.zh-CN.md)
 
-The intended audio path is:
+Mac Display Volume lets macOS control an external display's audio volume like a
+normal speaker.
+
+Some displays expose HDMI, DisplayPort, or USB-C audio to macOS as a fixed-volume
+output device. The keyboard volume keys and menu bar volume slider may be
+disabled, or they may change the display's own hardware volume. If the same
+display is also used with Windows, a game console, or another device, that shared
+hardware volume can become annoying quickly.
+
+Mac Display Volume creates a virtual audio output device on the Mac:
 
 ```text
 macOS apps
-  -> Mac Display Volume virtual output
-  -> low-latency software gain
-  -> real display audio device, such as P275MV
+  -> Mac Display Volume
+  -> software volume control
+  -> your real display speaker
 ```
 
-The display hardware volume stays fixed, so changing volume on macOS does not
-affect the same monitor when it is later used from Windows.
+Set the system output to `Mac Display Volume`, then choose the real display audio
+device as its target. macOS volume changes are applied in software before the
+audio is forwarded to the display. The display's own hardware volume can stay
+fixed, so changing volume on macOS does not affect the same monitor when it is
+used from another machine.
 
-## Status
+## Who It Is For
 
-This repository contains a local-use v1:
+- You use an external display with built-in speakers or audio output.
+- macOS cannot adjust that display's volume normally.
+- You want volume changes to affect only the current Mac.
+- The same display is also used by Windows, a game console, or another device.
 
-- Swift 6 + SwiftUI settings app and menu bar controls.
-- CoreAudio device discovery, default-output switching, and driver configuration.
-- AudioServerPlugIn HAL driver with a virtual stereo output device.
-- Software volume/mute controls exposed to macOS.
-- Bounded relay buffer to avoid accumulating seconds of audio delay.
-- Local build/install/uninstall scripts.
+## Features
 
-The audio render path is C++ because `coreaudiod` loads AudioServerPlugIn drivers
-through a C ABI. The user-facing app and configuration layer are Swift.
+- Creates a macOS virtual audio output device.
+- Supports system volume and mute controls.
+- Forwards audio to the real display audio device with low latency.
+- Provides a menu bar app for choosing the target output device.
+- Can switch the default output to the virtual device.
+- Keeps the display's hardware volume unchanged.
 
 ## Requirements
 
 - macOS 15 or newer.
-- Xcode 26 or newer.
-- Swift 6.
-- A valid Apple code signing identity for the local HAL driver. Set
-  `CODE_SIGN_IDENTITY` if the default identity is not the one you want.
+- Apple Silicon Mac.
+- An external display with audio output.
 
-## Development
+## Installation
 
-Build the SwiftUI settings app:
-
-```sh
-Scripts/build-app.sh
-```
-
-Build the HAL driver:
-
-```sh
-Scripts/build-driver.sh
-```
-
-Install locally:
+The current version is intended for local build and installation. Xcode 26 or
+newer is required.
 
 ```sh
 Scripts/install-local.sh
 ```
 
-Uninstall locally:
+The install script builds the app and HAL driver, then installs them to:
 
-```sh
-Scripts/uninstall-local.sh
-```
+- `/Applications/Mac Display Volume.app`
+- `/Library/Audio/Plug-Ins/HAL/MacDisplayVolumeAudio.driver`
 
-After installing:
+You may be asked for an administrator password during installation. If the new
+audio device does not appear immediately after installation, restart CoreAudio.
+If it still does not appear, rebooting the Mac usually clears stale CoreAudio
+caches and old driver helper processes.
+
+## Usage
 
 1. Open `/Applications/Mac Display Volume.app`.
 2. Choose the real display audio device, for example `P275MV`.
 3. Click **Apply Driver Config**.
 4. Click **Use Virtual Output**.
-5. Keep the monitor hardware volume fixed.
+5. Keep the display's own hardware volume fixed.
 
-If latency ever starts accumulating, use **Reset Relay** first. If CoreAudio is
-wedged, use **Restart coreaudiod** from the menu bar or settings window.
+After that, use the keyboard volume keys, the menu bar volume slider, or System
+Settings to control the volume of `Mac Display Volume`.
 
-## Driver Properties
+## Notes
 
-The app talks to the HAL driver through custom CoreAudio properties on the
-virtual device:
+- The target output device must support `48 kHz`.
+- Do not set `Mac Display Volume` itself as the target device.
+- If audio latency starts accumulating, use **Reset Relay** first.
+- If CoreAudio gets into a bad state, use **Restart coreaudiod** or reboot the
+  Mac.
 
-- `tgud`: target output device UID, `CFString`.
-- `bfsz`: preferred buffer frame size, `UInt32`.
-- `stat`: diagnostic status, `CFString`.
-- `rset`: reset relay command.
+## Uninstall
 
-The driver persists `tgud` and `bfsz` through AudioServerPlugIn host storage.
+```sh
+Scripts/uninstall-local.sh
+```
 
-## Latency Policy
+The uninstall script removes the app and HAL driver, then restarts CoreAudio.
 
-The relay uses a fixed 8192-frame stereo ring buffer. When queued audio grows
-past 2048 frames, the oldest frames are dropped and the driver re-anchors its
-timeline. This intentionally favors a tiny discontinuity over multi-second
-latency drift.
+## How It Works
+
+Mac Display Volume has two parts:
+
+- SwiftUI menu bar app: selects the target device, applies configuration, and
+  switches the default output.
+- CoreAudio HAL driver: exposes the virtual output device, applies software
+  volume, and forwards audio.
+
+The driver uses a fixed-size relay buffer. When too much audio is queued, it
+drops the oldest frames and re-anchors the timeline to avoid accumulating
+multi-second latency.
 
 ## License
 
