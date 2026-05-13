@@ -4,7 +4,7 @@ import Foundation
 public enum AudioHardwareError: Error, LocalizedError {
     case propertySize(AudioObjectID, AudioObjectPropertySelector, OSStatus)
     case propertyRead(AudioObjectID, AudioObjectPropertySelector, OSStatus)
-    case propertyWrite(AudioObjectID, AudioObjectPropertySelector, OSStatus)
+    case propertyWrite(AudioObjectID, AudioObjectPropertySelector, AudioObjectPropertyScope, OSStatus)
     case deviceNotFound(String)
     case invalidTargetDevice(String)
     case unsupportedSampleRate(String, Double)
@@ -16,8 +16,8 @@ public enum AudioHardwareError: Error, LocalizedError {
             "Could not read property size for object \(objectID), selector \(selector.fourCC), status \(status)."
         case let .propertyRead(objectID, selector, status):
             "Could not read property for object \(objectID), selector \(selector.fourCC), status \(status)."
-        case let .propertyWrite(objectID, selector, status):
-            "Could not write property for object \(objectID), selector \(selector.fourCC), status \(status)."
+        case let .propertyWrite(objectID, selector, scope, status):
+            "Could not write property for object \(objectID), selector \(selector.fourCC), scope \(scope.fourCC), status \(status)."
         case let .deviceNotFound(name):
             "Audio device not found: \(name)."
         case let .invalidTargetDevice(name):
@@ -92,10 +92,19 @@ public struct AudioHardware: Sendable {
             Self.targetUIDSelector,
             configuration.targetOutputDeviceUID
         )
-        try setUInt32Property(
+        try setPreferredBufferFrameSize(UInt32(configuration.preferredBufferFrameSize), virtualDeviceID: virtualDeviceID)
+    }
+
+    public func setPreferredBufferFrameSize(_ value: UInt32) throws {
+        let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
+        try setPreferredBufferFrameSize(value, virtualDeviceID: virtualDeviceID)
+    }
+
+    private func setPreferredBufferFrameSize(_ value: UInt32, virtualDeviceID: AudioDeviceID) throws {
+        try setNumberProperty(
             virtualDeviceID,
             Self.bufferFrameSizeSelector,
-            UInt32(configuration.preferredBufferFrameSize)
+            value
         )
     }
 
@@ -120,6 +129,11 @@ public struct AudioHardware: Sendable {
         return try stringProperty(virtualDeviceID, Self.targetUIDSelector)
     }
 
+    public func driverPreferredBufferFrameSize() throws -> Int {
+        let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
+        return Int(try numberProperty(virtualDeviceID, Self.bufferFrameSizeSelector))
+    }
+
     public func driverStatus() throws -> DriverStatus {
         let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
         return DriverStatus.parse(try stringProperty(virtualDeviceID, Self.statusSelector))
@@ -127,7 +141,7 @@ public struct AudioHardware: Sendable {
 
     public func resetRelay() throws {
         let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
-        try setUInt32Property(virtualDeviceID, Self.resetSelector, 1)
+        try setEmptyProperty(virtualDeviceID, Self.resetSelector)
     }
 
     public func restartCoreAudio() async throws {
@@ -252,6 +266,7 @@ public struct AudioHardware: Sendable {
             throw AudioHardwareError.propertyWrite(
                 AudioObjectID(kAudioObjectSystemObject),
                 selector,
+                kAudioObjectPropertyScopeGlobal,
                 status
             )
         }
@@ -279,11 +294,11 @@ public struct AudioHardware: Sendable {
             )
         }
         guard status == noErr else {
-            throw AudioHardwareError.propertyWrite(objectID, selector, status)
+            throw AudioHardwareError.propertyWrite(objectID, selector, kAudioObjectPropertyScopeGlobal, status)
         }
     }
 
-    private func setUInt32Property(
+    private func setNumberProperty(
         _ objectID: AudioObjectID,
         _ selector: AudioObjectPropertySelector,
         _ value: UInt32
@@ -294,17 +309,101 @@ public struct AudioHardware: Sendable {
             mElement: kAudioObjectPropertyElementMain
         )
         var mutableValue = value
-        let status = AudioObjectSetPropertyData(
+        guard let number = CFNumberCreate(nil, .sInt32Type, &mutableValue) else {
+            throw AudioHardwareError.propertyWrite(objectID, selector, kAudioObjectPropertyScopeGlobal, kAudioHardwareIllegalOperationError)
+        }
+        var propertyList: CFPropertyList = number
+        let status = withUnsafePointer(to: &propertyList) { pointer in
+            AudioObjectSetPropertyData(
+                objectID,
+                &address,
+                0,
+                nil,
+                UInt32(MemoryLayout<CFPropertyList>.size),
+                pointer
+            )
+        }
+        guard status == noErr else {
+            throw AudioHardwareError.propertyWrite(objectID, selector, kAudioObjectPropertyScopeGlobal, status)
+        }
+    }
+
+    private func setEmptyProperty(
+        _ objectID: AudioObjectID,
+        _ selector: AudioObjectPropertySelector
+    ) throws {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var unused: UInt8 = 0
+        let status = withUnsafePointer(to: &unused) { pointer in
+            AudioObjectSetPropertyData(
+                objectID,
+                &address,
+                0,
+                nil,
+                0,
+                pointer
+            )
+        }
+        guard status == noErr else {
+            throw AudioHardwareError.propertyWrite(objectID, selector, kAudioObjectPropertyScopeGlobal, status)
+        }
+    }
+
+    private func setUInt32Property(
+        _ objectID: AudioObjectID,
+        _ selector: AudioObjectPropertySelector,
+        _ value: UInt32,
+        fallbackScope: AudioObjectPropertyScope? = nil
+    ) throws {
+        var mutableValue = value
+        let status = setUInt32Property(
+            objectID,
+            selector,
+            &mutableValue,
+            scope: kAudioObjectPropertyScopeGlobal
+        )
+        if status == noErr {
+            return
+        }
+        if status == kAudioHardwareUnknownPropertyError, let fallbackScope {
+            var fallbackValue = value
+            let fallbackStatus = setUInt32Property(
+                objectID,
+                selector,
+                &fallbackValue,
+                scope: fallbackScope
+            )
+            if fallbackStatus == noErr {
+                return
+            }
+            throw AudioHardwareError.propertyWrite(objectID, selector, fallbackScope, fallbackStatus)
+        }
+        throw AudioHardwareError.propertyWrite(objectID, selector, kAudioObjectPropertyScopeGlobal, status)
+    }
+
+    private func setUInt32Property(
+        _ objectID: AudioObjectID,
+        _ selector: AudioObjectPropertySelector,
+        _ value: inout UInt32,
+        scope: AudioObjectPropertyScope
+    ) -> OSStatus {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        return AudioObjectSetPropertyData(
             objectID,
             &address,
             0,
             nil,
             UInt32(MemoryLayout<UInt32>.size),
-            &mutableValue
+            &value
         )
-        guard status == noErr else {
-            throw AudioHardwareError.propertyWrite(objectID, selector, status)
-        }
     }
 
     private func deviceIDProperty(_ selector: AudioObjectPropertySelector) throws -> AudioDeviceID {
@@ -379,6 +478,37 @@ public struct AudioHardware: Sendable {
             throw AudioHardwareError.propertyRead(objectID, selector, status)
         }
         return value
+    }
+
+    private func numberProperty(
+        _ objectID: AudioObjectID,
+        _ selector: AudioObjectPropertySelector
+    ) throws -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: Unmanaged<CFPropertyList>? = nil
+        var dataSize = UInt32(MemoryLayout<Unmanaged<CFPropertyList>>.size)
+        let status = withUnsafeMutablePointer(to: &value) { pointer in
+            AudioObjectGetPropertyData(objectID, &address, 0, nil, &dataSize, pointer)
+        }
+        guard status == noErr else {
+            throw AudioHardwareError.propertyRead(objectID, selector, status)
+        }
+        guard let unmanagedValue = value else {
+            throw AudioHardwareError.propertyRead(objectID, selector, kAudioHardwareIllegalOperationError)
+        }
+        let propertyList = unmanagedValue.takeRetainedValue()
+        guard CFGetTypeID(propertyList) == CFNumberGetTypeID() else {
+            throw AudioHardwareError.propertyRead(objectID, selector, kAudioHardwareIllegalOperationError)
+        }
+        var result: UInt32 = 0
+        guard CFNumberGetValue((propertyList as! CFNumber), .sInt32Type, &result) else {
+            throw AudioHardwareError.propertyRead(objectID, selector, kAudioHardwareIllegalOperationError)
+        }
+        return result
     }
 
     private func doubleProperty(

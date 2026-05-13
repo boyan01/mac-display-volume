@@ -3,6 +3,7 @@ import Foundation
 public struct DriverStatus: Equatable, Sendable {
     public var isRunning: Bool
     public var targetAlive: Bool
+    public var isPriming: Bool
     public var queuedFrames: Int
     public var queuedMilliseconds: Double
     public var bufferFrames: Int
@@ -13,6 +14,7 @@ public struct DriverStatus: Equatable, Sendable {
     public init(
         isRunning: Bool = false,
         targetAlive: Bool = false,
+        isPriming: Bool = false,
         queuedFrames: Int = 0,
         queuedMilliseconds: Double = 0,
         bufferFrames: Int = 0,
@@ -22,6 +24,7 @@ public struct DriverStatus: Equatable, Sendable {
     ) {
         self.isRunning = isRunning
         self.targetAlive = targetAlive
+        self.isPriming = isPriming
         self.queuedFrames = queuedFrames
         self.queuedMilliseconds = queuedMilliseconds
         self.bufferFrames = bufferFrames
@@ -41,6 +44,7 @@ public struct DriverStatus: Equatable, Sendable {
         return DriverStatus(
             isRunning: (Int(values["running"] ?? "0") ?? 0) > 0,
             targetAlive: values["target"] == "yes",
+            isPriming: values["priming"] == "yes",
             queuedFrames: Int(values["queuedFrames"] ?? "0") ?? 0,
             queuedMilliseconds: Double(values["queuedMS"] ?? "0") ?? 0,
             bufferFrames: Int(values["bufferFrames"] ?? "0") ?? 0,

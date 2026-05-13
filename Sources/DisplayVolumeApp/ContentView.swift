@@ -18,8 +18,8 @@ struct ContentView: View {
                     }
 
                     LabeledContent("Status") {
-                        Text(store.driverStatus.isRunning ? String(localized: "Running") : String(localized: "Idle"))
-                            .foregroundStyle(.secondary)
+                        Text(driverStatusText)
+                            .foregroundStyle(store.driverStatus.isPriming && store.driverStatus.isRunning ? .orange : .secondary)
                     }
 
                     LabeledContent("Queued latency") {
@@ -61,9 +61,9 @@ struct ContentView: View {
 
                 Section("Latency") {
                     Picker("Preferred buffer", selection: $store.configuration.preferredBufferFrameSize) {
-                        Text("64 frames").tag(64)
-                        Text("128 frames").tag(128)
-                        Text("256 frames").tag(256)
+                        ForEach(DisplayVolumeConfiguration.supportedBufferFrameSizes, id: \.self) { frameSize in
+                            Text("\(frameSize) frames").tag(frameSize)
+                        }
                     }
                     .pickerStyle(.segmented)
                     .onChange(of: store.configuration.preferredBufferFrameSize) { _, newValue in
@@ -128,6 +128,16 @@ struct ContentView: View {
             }
         }
         .padding(24)
+    }
+
+    private var driverStatusText: String {
+        if !store.driverStatus.isRunning {
+            return String(localized: "Idle")
+        }
+        if store.driverStatus.isPriming {
+            return String(localized: "Priming")
+        }
+        return String(localized: "Running")
     }
 
     private var header: some View {

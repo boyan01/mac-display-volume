@@ -7,6 +7,8 @@
 #include <dispatch/dispatch.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstddef>
 #include <cmath>
 #include <cstring>
@@ -36,6 +38,8 @@ constexpr UInt32 kBytesPerFrame = kChannels * kBytesPerChannel;
 constexpr UInt32 kRingCapacityFrames = 8192;
 constexpr UInt32 kMaxQueuedFrames = 2048;
 constexpr UInt32 kDefaultBufferFrames = 128;
+constexpr UInt32 kZeroTimestampPeriodFrames = 16384;
+constexpr int64_t kTargetStartDelayNanos = 200000000;
 constexpr Float64 kDefaultSampleRate = 48000.0;
 constexpr Float32 kMinDB = -60.0f;
 constexpr Float32 kMaxDB = 0.0f;
@@ -45,23 +49,25 @@ UInt32 gRefCount = 1;
 
 std::mutex gStateMutex;
 dispatch_queue_t gTargetQueue = dispatch_queue_create("tech.soit.MacDisplayVolume.target", DISPATCH_QUEUE_SERIAL);
-std::array<Float32, kRingCapacityFrames * kChannels> gRing {};
-UInt32 gReadFrame = 0;
-UInt32 gQueuedFrames = 0;
-UInt32 gRunningClients = 0;
-UInt32 gPreferredBufferFrames = kDefaultBufferFrames;
-Float64 gSampleRate = kDefaultSampleRate;
-Float32 gVolumeLeft = 1.0f;
-Float32 gVolumeRight = 1.0f;
-bool gMute = false;
+std::array<std::atomic<Float32>, kRingCapacityFrames * kChannels> gRing {};
+std::atomic<UInt64> gReadPosition { 0 };
+std::atomic<UInt64> gWritePosition { 0 };
+std::atomic<UInt32> gRunningClients { 0 };
+std::atomic<UInt32> gPreferredBufferFrames { kDefaultBufferFrames };
+std::atomic<Float64> gSampleRate { kDefaultSampleRate };
+std::atomic<Float32> gVolumeLeft { 1.0f };
+std::atomic<Float32> gVolumeRight { 1.0f };
+std::atomic_bool gMute { false };
+std::atomic_bool gRelayPriming { true };
 bool gBoxAcquired = true;
-UInt64 gZeroTimestampSeed = 1;
-UInt64 gAnchorHostTime = 0;
-Float64 gAnchorSampleTime = 0.0;
-UInt64 gFramesWritten = 0;
-UInt64 gFramesRead = 0;
-UInt64 gDroppedFrames = 0;
-UInt64 gUnderruns = 0;
+std::atomic<UInt64> gZeroTimestampSeed { 1 };
+std::atomic<UInt64> gAnchorHostTime { 0 };
+std::atomic<Float64> gAnchorSampleTime { 0.0 };
+std::atomic<UInt64> gFramesWritten { 0 };
+std::atomic<UInt64> gFramesRead { 0 };
+std::atomic<UInt64> gDroppedFrames { 0 };
+std::atomic<UInt64> gUnderruns { 0 };
+std::atomic<UInt64> gTargetStartGeneration { 0 };
 AudioDeviceID gTargetDevice = kAudioObjectUnknown;
 AudioDeviceIOProcID gTargetIOProcID = nullptr;
 CFStringRef gTargetUID = nullptr;
@@ -73,6 +79,7 @@ struct StateSnapshot {
     UInt64 droppedFrames;
     UInt64 underruns;
     bool targetAlive;
+    bool relayPriming;
 };
 
 AudioObjectPropertyAddress MakeAddress(AudioObjectPropertySelector selector,
@@ -114,6 +121,13 @@ bool IsEmptyString(CFStringRef value) {
 
 bool IsVirtualDeviceUID(CFStringRef value) {
     return value != nullptr && CFStringCompare(value, CFSTR("tech.soit.MacDisplayVolume.Device"), 0) == kCFCompareEqualTo;
+}
+
+bool StringValuesEqual(CFStringRef lhs, CFStringRef rhs) {
+    if (IsEmptyString(lhs) && IsEmptyString(rhs)) {
+        return true;
+    }
+    return lhs != nullptr && rhs != nullptr && CFStringCompare(lhs, rhs, 0) == kCFCompareEqualTo;
 }
 
 bool IsSupportedTargetSampleRate(Float64 sampleRate) {
@@ -211,17 +225,52 @@ void Notify(AudioObjectID objectID,
 }
 
 void ReanchorTimelineLocked() {
-    gZeroTimestampSeed += 1;
-    gAnchorHostTime = AudioGetCurrentHostTime();
-    gAnchorSampleTime = 0.0;
+    gZeroTimestampSeed.fetch_add(1, std::memory_order_relaxed);
+    gAnchorHostTime.store(AudioGetCurrentHostTime(), std::memory_order_release);
+    gAnchorSampleTime.store(0.0, std::memory_order_release);
 }
 
-void FlushRingLocked() {
-    gReadFrame = 0;
-    gQueuedFrames = 0;
-    gFramesWritten = 0;
-    gFramesRead = 0;
+void FlushRingLocked(bool resetHealth = false) {
+    UInt64 writePosition = gWritePosition.load(std::memory_order_acquire);
+    gReadPosition.store(writePosition, std::memory_order_release);
+    gRelayPriming.store(true, std::memory_order_release);
+    gFramesWritten.store(0, std::memory_order_relaxed);
+    gFramesRead.store(0, std::memory_order_relaxed);
+    if (resetHealth) {
+        gDroppedFrames.store(0, std::memory_order_relaxed);
+        gUnderruns.store(0, std::memory_order_relaxed);
+    }
     ReanchorTimelineLocked();
+}
+
+UInt64 AdvanceReadPositionAtLeast(UInt64 minimumReadPosition) {
+    UInt64 current = gReadPosition.load(std::memory_order_acquire);
+    while (current < minimumReadPosition) {
+        if (gReadPosition.compare_exchange_weak(
+                current,
+                minimumReadPosition,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire
+            )) {
+            return minimumReadPosition - current;
+        }
+    }
+    return 0;
+}
+
+UInt32 QueuedFrames() {
+    UInt64 writePosition = gWritePosition.load(std::memory_order_acquire);
+    UInt64 readPosition = gReadPosition.load(std::memory_order_acquire);
+    if (writePosition <= readPosition) {
+        return 0;
+    }
+    return static_cast<UInt32>(std::min<UInt64>(writePosition - readPosition, std::numeric_limits<UInt32>::max()));
+}
+
+UInt32 PrebufferFramesFor(UInt32 requestedFrames) {
+    UInt32 preferredFrames = gPreferredBufferFrames.load(std::memory_order_relaxed);
+    UInt32 preferredPrebuffer = std::clamp<UInt32>(preferredFrames * 4, 512, kMaxQueuedFrames / 2);
+    return std::min<UInt32>(kMaxQueuedFrames, std::max(preferredPrebuffer, requestedFrames));
 }
 
 void StoreFrames(const Float32 *input, UInt32 frames) {
@@ -229,30 +278,32 @@ void StoreFrames(const Float32 *input, UInt32 frames) {
         return;
     }
 
-    std::unique_lock<std::mutex> lock(gStateMutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        return;
+    if (frames > kRingCapacityFrames) {
+        UInt32 skippedFrames = frames - kRingCapacityFrames;
+        input += skippedFrames * kChannels;
+        frames = kRingCapacityFrames;
+        gDroppedFrames.fetch_add(skippedFrames, std::memory_order_relaxed);
     }
 
+    UInt64 writePosition = gWritePosition.load(std::memory_order_relaxed);
     for (UInt32 frame = 0; frame < frames; ++frame) {
-        if (gQueuedFrames >= kRingCapacityFrames) {
-            gReadFrame = (gReadFrame + 1) % kRingCapacityFrames;
-            gQueuedFrames -= 1;
-            gDroppedFrames += 1;
-        }
-
-        UInt32 writeFrame = (gReadFrame + gQueuedFrames) % kRingCapacityFrames;
-        gRing[(writeFrame * kChannels) + 0] = input[(frame * kChannels) + 0];
-        gRing[(writeFrame * kChannels) + 1] = input[(frame * kChannels) + 1];
-        gQueuedFrames += 1;
-        gFramesWritten += 1;
+        UInt64 absoluteFrame = writePosition + frame;
+        UInt32 ringFrame = static_cast<UInt32>(absoluteFrame % kRingCapacityFrames);
+        gRing[(ringFrame * kChannels) + 0].store(input[(frame * kChannels) + 0], std::memory_order_relaxed);
+        gRing[(ringFrame * kChannels) + 1].store(input[(frame * kChannels) + 1], std::memory_order_relaxed);
     }
 
-    if (gQueuedFrames > kMaxQueuedFrames) {
-        UInt32 excess = gQueuedFrames - kMaxQueuedFrames;
-        gReadFrame = (gReadFrame + excess) % kRingCapacityFrames;
-        gQueuedFrames = kMaxQueuedFrames;
-        gDroppedFrames += excess;
+    UInt64 afterWritePosition = writePosition + frames;
+    gWritePosition.store(afterWritePosition, std::memory_order_release);
+    gFramesWritten.fetch_add(frames, std::memory_order_relaxed);
+
+    if (afterWritePosition > kMaxQueuedFrames) {
+        UInt64 minimumReadPosition = afterWritePosition - kMaxQueuedFrames;
+        UInt64 advancedFrames = AdvanceReadPositionAtLeast(minimumReadPosition);
+        bool isPriming = gRelayPriming.load(std::memory_order_acquire);
+        if (advancedFrames > 0 && !isPriming) {
+            gDroppedFrames.fetch_add(advancedFrames, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -261,31 +312,43 @@ UInt32 FetchFrames(Float32 *output, UInt32 frames) {
         return 0;
     }
 
-    std::unique_lock<std::mutex> lock(gStateMutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
+    UInt64 readPosition = gReadPosition.load(std::memory_order_acquire);
+    UInt64 writePosition = gWritePosition.load(std::memory_order_acquire);
+    UInt64 availableFrames = writePosition > readPosition ? writePosition - readPosition : 0;
+    UInt32 prebufferFrames = PrebufferFramesFor(frames);
+    bool wasPriming = gRelayPriming.load(std::memory_order_acquire);
+    if (wasPriming && availableFrames < prebufferFrames) {
         std::memset(output, 0, frames * kBytesPerFrame);
         return 0;
     }
-    UInt32 produced = std::min(frames, gQueuedFrames);
-    Float32 gainLeft = gMute ? 0.0f : gVolumeLeft;
-    Float32 gainRight = gMute ? 0.0f : gVolumeRight;
+
+    if (wasPriming) {
+        gRelayPriming.store(false, std::memory_order_release);
+    }
+
+    UInt32 produced = std::min<UInt32>(frames, static_cast<UInt32>(std::min<UInt64>(availableFrames, std::numeric_limits<UInt32>::max())));
+    bool muted = gMute.load(std::memory_order_relaxed);
+    Float32 gainLeft = muted ? 0.0f : gVolumeLeft.load(std::memory_order_relaxed);
+    Float32 gainRight = muted ? 0.0f : gVolumeRight.load(std::memory_order_relaxed);
 
     for (UInt32 frame = 0; frame < produced; ++frame) {
-        UInt32 readFrame = (gReadFrame + frame) % kRingCapacityFrames;
-        output[(frame * kChannels) + 0] = gRing[(readFrame * kChannels) + 0] * gainLeft;
-        output[(frame * kChannels) + 1] = gRing[(readFrame * kChannels) + 1] * gainRight;
+        UInt64 absoluteFrame = readPosition + frame;
+        UInt32 ringFrame = static_cast<UInt32>(absoluteFrame % kRingCapacityFrames);
+        output[(frame * kChannels) + 0] = gRing[(ringFrame * kChannels) + 0].load(std::memory_order_relaxed) * gainLeft;
+        output[(frame * kChannels) + 1] = gRing[(ringFrame * kChannels) + 1].load(std::memory_order_relaxed) * gainRight;
     }
 
     if (produced < frames) {
         std::memset(output + (produced * kChannels), 0, (frames - produced) * kBytesPerFrame);
-        if (gRunningClients > 0) {
-            gUnderruns += 1;
+        gRelayPriming.store(true, std::memory_order_release);
+        if (gRunningClients.load(std::memory_order_relaxed) > 0) {
+            gUnderruns.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
-    gReadFrame = (gReadFrame + produced) % kRingCapacityFrames;
-    gQueuedFrames -= produced;
-    gFramesRead += produced;
+    UInt64 consumedPosition = readPosition + produced;
+    AdvanceReadPositionAtLeast(consumedPosition);
+    gFramesRead.fetch_add(produced, std::memory_order_relaxed);
     return produced;
 }
 
@@ -461,7 +524,10 @@ void LoadConfigurationFromStorage() {
             SInt32 value = 0;
             if (CFNumberGetValue(static_cast<CFNumberRef>(data), kCFNumberSInt32Type, &value)) {
                 std::lock_guard<std::mutex> lock(gStateMutex);
-                gPreferredBufferFrames = std::clamp<UInt32>(static_cast<UInt32>(value), 64, 256);
+                gPreferredBufferFrames.store(
+                    std::clamp<UInt32>(static_cast<UInt32>(std::max<SInt32>(value, 0)), 64, 256),
+                    std::memory_order_release
+                );
             }
         }
         CFRelease(data);
@@ -560,7 +626,7 @@ void StartTargetDevice() {
     bool shouldStop = false;
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
-        if (gRunningClients > 0) {
+        if (gRunningClients.load(std::memory_order_relaxed) > 0) {
             gTargetDevice = target;
             gTargetIOProcID = ioProcID;
         } else {
@@ -573,14 +639,49 @@ void StartTargetDevice() {
     }
 }
 
+void CancelScheduledTargetStart() {
+    gTargetStartGeneration.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void ScheduleStartTargetDevice() {
+    UInt64 generation = gTargetStartGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kTargetStartDelayNanos), gTargetQueue, ^{
+        if (gTargetStartGeneration.load(std::memory_order_acquire) != generation) {
+            return;
+        }
+        if (gRunningClients.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        StartTargetDevice();
+    });
+}
+
+void ScheduleStopTargetDevice() {
+    CancelScheduledTargetStart();
+    dispatch_async(gTargetQueue, ^{
+        StopTargetDevice();
+    });
+}
+
+void ScheduleRestartTargetDevice(bool shouldStartTarget) {
+    CancelScheduledTargetStart();
+    dispatch_async(gTargetQueue, ^{
+        StopTargetDevice();
+    });
+    if (shouldStartTarget) {
+        ScheduleStartTargetDevice();
+    }
+}
+
 StateSnapshot SnapshotLocked() {
     return StateSnapshot {
-        gQueuedFrames,
-        gPreferredBufferFrames,
-        gSampleRate,
-        gDroppedFrames,
-        gUnderruns,
+        QueuedFrames(),
+        gPreferredBufferFrames.load(std::memory_order_acquire),
+        gSampleRate.load(std::memory_order_acquire),
+        gDroppedFrames.load(std::memory_order_acquire),
+        gUnderruns.load(std::memory_order_acquire),
         gTargetDevice != kAudioObjectUnknown && gTargetIOProcID != nullptr,
+        gRelayPriming.load(std::memory_order_acquire),
     };
 }
 
@@ -592,9 +693,10 @@ CFStringRef CopyStatusString() {
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "running=%u,target=%s,queuedFrames=%u,queuedMS=%.2f,bufferFrames=%u,dropped=%llu,underruns=%llu,sampleRate=%.0f",
-        gRunningClients,
+        "running=%u,target=%s,priming=%s,queuedFrames=%u,queuedMS=%.2f,bufferFrames=%u,dropped=%llu,underruns=%llu,sampleRate=%.0f",
+        gRunningClients.load(std::memory_order_acquire),
         snapshot.targetAlive ? "yes" : "no",
+        snapshot.relayPriming ? "yes" : "no",
         snapshot.queuedFrames,
         queuedMS,
         snapshot.preferredBufferFrames,
@@ -674,6 +776,8 @@ Boolean HasDeviceProperty(AudioObjectPropertySelector selector, AudioObjectPrope
     case kAudioDevicePropertyPlugIn:
     case kAudioDevicePropertyRelatedDevices:
     case kAudioDevicePropertyClockDomain:
+    case kAudioDevicePropertyClockAlgorithm:
+    case kAudioDevicePropertyClockIsStable:
     case kAudioDevicePropertyDeviceIsAlive:
     case kAudioDevicePropertyDeviceIsRunning:
     case kAudioDevicePropertyDeviceIsRunningSomewhere:
@@ -704,7 +808,7 @@ Boolean HasDeviceProperty(AudioObjectPropertySelector selector, AudioObjectPrope
     case kPropertyBufferFrameSize:
     case kPropertyStatus:
     case kPropertyReset:
-        return scope == kAudioObjectPropertyScopeGlobal || scope == kAudioObjectPropertyScopeOutput;
+        return true;
     default:
         return false;
     }
@@ -825,7 +929,7 @@ OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjec
         if (static_cast<Float64>(action) != kDefaultSampleRate) {
             return kAudioHardwareIllegalOperationError;
         }
-        gSampleRate = kDefaultSampleRate;
+        gSampleRate.store(kDefaultSampleRate, std::memory_order_release);
         FlushRingLocked();
     }
     return noErr;
@@ -970,6 +1074,9 @@ OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef,
         return noErr;
     case kAudioDevicePropertyPreferredChannelLayout:
         *outDataSize = offsetof(AudioChannelLayout, mChannelDescriptions) + (kChannels * sizeof(AudioChannelDescription));
+        return noErr;
+    case kPropertyBufferFrameSize:
+        *outDataSize = sizeof(CFPropertyListRef);
         return noErr;
     case kAudioDevicePropertyNominalSampleRate:
     case kAudioDevicePropertyActualSampleRate:
@@ -1145,13 +1252,27 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
         *outDataSize = WriteObjectIDs(outData, inDataSize, ids, 1);
         return noErr;
     }
-    case kAudioDevicePropertyClockDomain:
     case kAudioDevicePropertyLatency:
     case kAudioDevicePropertySafetyOffset:
     case kAudioDevicePropertyIsHidden:
     case kAudioDevicePropertyUsesVariableBufferFrameSizes:
         if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
         *static_cast<UInt32 *>(outData) = 0;
+        *outDataSize = sizeof(UInt32);
+        return noErr;
+    case kAudioDevicePropertyClockDomain:
+        if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
+        *static_cast<UInt32 *>(outData) = 0;
+        *outDataSize = sizeof(UInt32);
+        return noErr;
+    case kAudioDevicePropertyClockAlgorithm:
+        if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
+        *static_cast<UInt32 *>(outData) = kAudioDeviceClockAlgorithmRaw;
+        *outDataSize = sizeof(UInt32);
+        return noErr;
+    case kAudioDevicePropertyClockIsStable:
+        if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
+        *static_cast<UInt32 *>(outData) = 1;
         *outDataSize = sizeof(UInt32);
         return noErr;
     case kAudioDevicePropertyDeviceIsAlive:
@@ -1165,19 +1286,13 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
     case kAudioDevicePropertyDeviceIsRunning:
     case kAudioDevicePropertyDeviceIsRunningSomewhere:
         if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
-        {
-            std::lock_guard<std::mutex> lock(gStateMutex);
-            *static_cast<UInt32 *>(outData) = gRunningClients > 0 ? 1 : 0;
-        }
+        *static_cast<UInt32 *>(outData) = gRunningClients.load(std::memory_order_acquire) > 0 ? 1 : 0;
         *outDataSize = sizeof(UInt32);
         return noErr;
     case kAudioDevicePropertyNominalSampleRate:
     case kAudioDevicePropertyActualSampleRate:
         if (inDataSize < sizeof(Float64)) { return kAudioHardwareBadPropertySizeError; }
-        {
-            std::lock_guard<std::mutex> lock(gStateMutex);
-            *static_cast<Float64 *>(outData) = gSampleRate;
-        }
+        *static_cast<Float64 *>(outData) = gSampleRate.load(std::memory_order_acquire);
         *outDataSize = sizeof(Float64);
         return noErr;
     case kAudioDevicePropertyHogMode:
@@ -1198,10 +1313,7 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
         return noErr;
     case kAudioDevicePropertyZeroTimeStampPeriod:
         if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
-        {
-            std::lock_guard<std::mutex> lock(gStateMutex);
-            *static_cast<UInt32 *>(outData) = gPreferredBufferFrames;
-        }
+        *static_cast<UInt32 *>(outData) = kZeroTimestampPeriodFrames;
         *outDataSize = sizeof(UInt32);
         return noErr;
     case kAudioDevicePropertyStreams: {
@@ -1228,13 +1340,18 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
         *outDataSize = offsetof(AudioBufferList, mBuffers) + sizeof(AudioBuffer);
         return noErr;
     case kAudioDevicePropertyBufferFrameSize:
-    case kPropertyBufferFrameSize:
         if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
-        {
-            std::lock_guard<std::mutex> lock(gStateMutex);
-            *static_cast<UInt32 *>(outData) = gPreferredBufferFrames;
-        }
+        *static_cast<UInt32 *>(outData) = gPreferredBufferFrames.load(std::memory_order_acquire);
         *outDataSize = sizeof(UInt32);
+        return noErr;
+    case kPropertyBufferFrameSize:
+        if (inDataSize < sizeof(CFPropertyListRef)) { return kAudioHardwareBadPropertySizeError; }
+        {
+            UInt32 value = 0;
+            value = gPreferredBufferFrames.load(std::memory_order_acquire);
+            *static_cast<CFPropertyListRef *>(outData) = CFNumberCreate(nullptr, kCFNumberSInt32Type, &value);
+        }
+        *outDataSize = sizeof(CFPropertyListRef);
         return noErr;
     case kAudioDevicePropertyBufferFrameSizeRange:
         if (inDataSize < sizeof(AudioValueRange)) { return kAudioHardwareBadPropertySizeError; }
@@ -1269,7 +1386,7 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
         {
             auto *info = static_cast<AudioServerPlugInCustomPropertyInfo *>(outData);
             info[0] = { kPropertyTargetUID, kAudioServerPlugInCustomPropertyDataTypeCFString, kAudioServerPlugInCustomPropertyDataTypeNone };
-            info[1] = { kPropertyBufferFrameSize, kAudioServerPlugInCustomPropertyDataTypeNone, kAudioServerPlugInCustomPropertyDataTypeNone };
+            info[1] = { kPropertyBufferFrameSize, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
             info[2] = { kPropertyStatus, kAudioServerPlugInCustomPropertyDataTypeCFString, kAudioServerPlugInCustomPropertyDataTypeNone };
             info[3] = { kPropertyReset, kAudioServerPlugInCustomPropertyDataTypeNone, kAudioServerPlugInCustomPropertyDataTypeNone };
         }
@@ -1293,10 +1410,7 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
     case kAudioStreamPropertyVirtualFormat:
     case kAudioStreamPropertyPhysicalFormat:
         if (inDataSize < sizeof(AudioStreamBasicDescription)) { return kAudioHardwareBadPropertySizeError; }
-        {
-            std::lock_guard<std::mutex> lock(gStateMutex);
-            *static_cast<AudioStreamBasicDescription *>(outData) = StreamFormatForSampleRate(gSampleRate);
-        }
+        *static_cast<AudioStreamBasicDescription *>(outData) = StreamFormatForSampleRate(gSampleRate.load(std::memory_order_acquire));
         *outDataSize = sizeof(AudioStreamBasicDescription);
         return noErr;
     case kAudioStreamPropertyAvailableVirtualFormats:
@@ -1322,10 +1436,9 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
         return noErr;
     case kAudioLevelControlPropertyScalarValue:
         if (inDataSize < sizeof(Float32)) { return kAudioHardwareBadPropertySizeError; }
-        {
-            std::lock_guard<std::mutex> lock(gStateMutex);
-            *static_cast<Float32 *>(outData) = objectID == kObjectIDVolumeLeft ? gVolumeLeft : gVolumeRight;
-        }
+        *static_cast<Float32 *>(outData) = objectID == kObjectIDVolumeLeft
+            ? gVolumeLeft.load(std::memory_order_acquire)
+            : gVolumeRight.load(std::memory_order_acquire);
         *outDataSize = sizeof(Float32);
         return noErr;
     case kAudioLevelControlPropertyDecibelValue:
@@ -1334,8 +1447,9 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
         {
             Float32 value = *static_cast<Float32 *>(outData);
             if (address->mSelector == kAudioLevelControlPropertyDecibelValue) {
-                std::lock_guard<std::mutex> lock(gStateMutex);
-                value = objectID == kObjectIDVolumeLeft ? gVolumeLeft : gVolumeRight;
+                value = objectID == kObjectIDVolumeLeft
+                    ? gVolumeLeft.load(std::memory_order_acquire)
+                    : gVolumeRight.load(std::memory_order_acquire);
             }
             *static_cast<Float32 *>(outData) = ScalarToDB(value);
         }
@@ -1354,10 +1468,7 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef,
         return noErr;
     case kAudioBooleanControlPropertyValue:
         if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
-        {
-            std::lock_guard<std::mutex> lock(gStateMutex);
-            *static_cast<UInt32 *>(outData) = gMute ? 1 : 0;
-        }
+        *static_cast<UInt32 *>(outData) = gMute.load(std::memory_order_acquire) ? 1 : 0;
         *outDataSize = sizeof(UInt32);
         return noErr;
     case kPropertyTargetUID:
@@ -1400,24 +1511,50 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
             if (inDataSize != sizeof(Float64)) { return kAudioHardwareBadPropertySizeError; }
             if (*static_cast<const Float64 *>(inData) != kDefaultSampleRate) { return kAudioHardwareIllegalOperationError; }
             return noErr;
-        case kAudioDevicePropertyBufferFrameSize:
-        case kPropertyBufferFrameSize: {
+        case kAudioDevicePropertyBufferFrameSize: {
             if (inDataSize != sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
             bool didChangeBufferFrames = false;
             UInt32 value = std::clamp(*static_cast<const UInt32 *>(inData), static_cast<UInt32>(64), static_cast<UInt32>(256));
             {
                 std::lock_guard<std::mutex> lock(gStateMutex);
-                if (gPreferredBufferFrames != value) {
-                    gPreferredBufferFrames = value;
+                if (gPreferredBufferFrames.load(std::memory_order_acquire) != value) {
+                    gPreferredBufferFrames.store(value, std::memory_order_release);
                     FlushRingLocked();
                     didChangeBufferFrames = true;
                 }
             }
             if (didChangeBufferFrames) {
                 SavePreferredBuffer(value);
+                Notify(kObjectIDDevice, kAudioDevicePropertyBufferFrameSize);
+                Notify(kObjectIDDevice, kPropertyBufferFrameSize);
             }
-            Notify(kObjectIDDevice, kAudioDevicePropertyBufferFrameSize);
-            Notify(kObjectIDDevice, kPropertyBufferFrameSize);
+            return noErr;
+        }
+        case kPropertyBufferFrameSize: {
+            if (inDataSize != sizeof(CFPropertyListRef)) { return kAudioHardwareBadPropertySizeError; }
+            CFPropertyListRef propertyList = *static_cast<CFPropertyListRef const *>(inData);
+            if (propertyList == nullptr || CFGetTypeID(propertyList) != CFNumberGetTypeID()) {
+                return kAudioHardwareBadPropertySizeError;
+            }
+            SInt32 rawValue = 0;
+            if (!CFNumberGetValue(static_cast<CFNumberRef>(propertyList), kCFNumberSInt32Type, &rawValue)) {
+                return kAudioHardwareBadPropertySizeError;
+            }
+            bool didChangeBufferFrames = false;
+            UInt32 value = std::clamp<UInt32>(static_cast<UInt32>(std::max<SInt32>(rawValue, 0)), 64, 256);
+            {
+                std::lock_guard<std::mutex> lock(gStateMutex);
+                if (gPreferredBufferFrames.load(std::memory_order_acquire) != value) {
+                    gPreferredBufferFrames.store(value, std::memory_order_release);
+                    FlushRingLocked();
+                    didChangeBufferFrames = true;
+                }
+            }
+            if (didChangeBufferFrames) {
+                SavePreferredBuffer(value);
+                Notify(kObjectIDDevice, kAudioDevicePropertyBufferFrameSize);
+                Notify(kObjectIDDevice, kPropertyBufferFrameSize);
+            }
             return noErr;
         }
         case kPropertyTargetUID: {
@@ -1436,24 +1573,22 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
             }
             {
                 std::lock_guard<std::mutex> lock(gStateMutex);
+                if (StringValuesEqual(gTargetUID, newUID)) {
+                    return noErr;
+                }
                 if (gTargetUID != nullptr) {
                     CFRelease(gTargetUID);
                 }
                 gTargetUID = newUID != nullptr ? CFStringCreateCopy(nullptr, newUID) : nullptr;
                 uidToSave = gTargetUID != nullptr ? CFStringCreateCopy(nullptr, gTargetUID) : nullptr;
                 FlushRingLocked();
-                shouldStartTarget = gRunningClients > 0;
+                shouldStartTarget = gRunningClients.load(std::memory_order_acquire) > 0;
             }
             SaveTargetUID(uidToSave);
             if (uidToSave != nullptr) {
                 CFRelease(uidToSave);
             }
-            dispatch_async(gTargetQueue, ^{
-                StopTargetDevice();
-                if (shouldStartTarget) {
-                    StartTargetDevice();
-                }
-            });
+            ScheduleRestartTargetDevice(shouldStartTarget);
             Notify(kObjectIDDevice, kPropertyTargetUID);
             Notify(kObjectIDDevice, kPropertyStatus);
             return noErr;
@@ -1461,7 +1596,7 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
         case kPropertyReset:
             {
                 std::lock_guard<std::mutex> lock(gStateMutex);
-                FlushRingLocked();
+                FlushRingLocked(true);
             }
             Notify(kObjectIDDevice, kPropertyStatus);
             return noErr;
@@ -1483,7 +1618,7 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
             }
         }
         if (shouldStopTarget) {
-            StopTargetDevice();
+            ScheduleStopTargetDevice();
         }
         Notify(kObjectIDBox, kAudioBoxPropertyAcquired);
         Notify(kObjectIDBox, kAudioBoxPropertyDeviceList);
@@ -1504,13 +1639,10 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
             return kAudioHardwareUnknownPropertyError;
         }
 
-        {
-            std::lock_guard<std::mutex> lock(gStateMutex);
-            if (objectID == kObjectIDVolumeLeft) {
-                gVolumeLeft = scalar;
-            } else {
-                gVolumeRight = scalar;
-            }
+        if (objectID == kObjectIDVolumeLeft) {
+            gVolumeLeft.store(scalar, std::memory_order_release);
+        } else {
+            gVolumeRight.store(scalar, std::memory_order_release);
         }
         Notify(objectID, kAudioLevelControlPropertyScalarValue);
         Notify(objectID, kAudioLevelControlPropertyDecibelValue);
@@ -1519,10 +1651,7 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef,
 
     if (objectID == kObjectIDMute && address->mSelector == kAudioBooleanControlPropertyValue) {
         if (inDataSize != sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
-        {
-            std::lock_guard<std::mutex> lock(gStateMutex);
-            gMute = *static_cast<const UInt32 *>(inData) != 0;
-        }
+        gMute.store(*static_cast<const UInt32 *>(inData) != 0, std::memory_order_release);
         Notify(kObjectIDMute, kAudioBooleanControlPropertyValue);
         return noErr;
     }
@@ -1538,21 +1667,21 @@ OSStatus StartIO(AudioServerPlugInDriverRef, AudioObjectID deviceID, UInt32) {
     bool shouldStartTarget = false;
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
-        if (gRunningClients == std::numeric_limits<UInt32>::max()) {
+        UInt32 runningClients = gRunningClients.load(std::memory_order_acquire);
+        if (runningClients == std::numeric_limits<UInt32>::max()) {
             return kAudioHardwareIllegalOperationError;
         }
 
-        gRunningClients += 1;
-        if (gRunningClients == 1) {
+        runningClients += 1;
+        gRunningClients.store(runningClients, std::memory_order_release);
+        if (runningClients == 1) {
             FlushRingLocked();
             shouldStartTarget = true;
         }
     }
 
     if (shouldStartTarget) {
-        dispatch_async(gTargetQueue, ^{
-            StartTargetDevice();
-        });
+        ScheduleStartTargetDevice();
     }
 
     Notify(kObjectIDDevice, kAudioDevicePropertyDeviceIsRunning);
@@ -1567,21 +1696,21 @@ OSStatus StopIO(AudioServerPlugInDriverRef, AudioObjectID deviceID, UInt32) {
     bool shouldStopTarget = false;
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
-        if (gRunningClients == 0) {
+        UInt32 runningClients = gRunningClients.load(std::memory_order_acquire);
+        if (runningClients == 0) {
             return kAudioHardwareIllegalOperationError;
         }
 
-        gRunningClients -= 1;
-        if (gRunningClients == 0) {
+        runningClients -= 1;
+        gRunningClients.store(runningClients, std::memory_order_release);
+        if (runningClients == 0) {
             FlushRingLocked();
             shouldStopTarget = true;
         }
     }
 
     if (shouldStopTarget) {
-        dispatch_async(gTargetQueue, ^{
-            StopTargetDevice();
-        });
+        ScheduleStopTargetDevice();
     }
 
     Notify(kObjectIDDevice, kAudioDevicePropertyDeviceIsRunning);
@@ -1594,27 +1723,29 @@ OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef,
                           Float64 *sampleTime,
                           UInt64 *hostTime,
                           UInt64 *seed) {
-    std::lock_guard<std::mutex> lock(gStateMutex);
     UInt64 currentHostTime = AudioGetCurrentHostTime();
+    UInt64 anchorHostTime = gAnchorHostTime.load(std::memory_order_acquire);
+    Float64 anchorSampleTime = gAnchorSampleTime.load(std::memory_order_acquire);
+    Float64 sampleRate = gSampleRate.load(std::memory_order_acquire);
     Float64 elapsedSeconds = 0.0;
-    if (gAnchorHostTime > 0 && currentHostTime > gAnchorHostTime) {
-        elapsedSeconds = static_cast<Float64>(AudioConvertHostTimeToNanos(currentHostTime - gAnchorHostTime)) / 1000000000.0;
+    if (anchorHostTime > 0 && currentHostTime > anchorHostTime) {
+        elapsedSeconds = static_cast<Float64>(AudioConvertHostTimeToNanos(currentHostTime - anchorHostTime)) / 1000000000.0;
     }
-    UInt32 periodFrames = std::max<UInt32>(gPreferredBufferFrames, 1);
-    UInt64 elapsedFrames = static_cast<UInt64>(std::floor(elapsedSeconds * gSampleRate));
+    UInt32 periodFrames = kZeroTimestampPeriodFrames;
+    UInt64 elapsedFrames = static_cast<UInt64>(std::floor(elapsedSeconds * sampleRate));
     UInt64 alignedFrames = (elapsedFrames / periodFrames) * periodFrames;
     UInt64 alignedHostOffset = AudioConvertNanosToHostTime(
-        static_cast<UInt64>((static_cast<Float64>(alignedFrames) / gSampleRate) * 1000000000.0)
+        static_cast<UInt64>((static_cast<Float64>(alignedFrames) / sampleRate) * 1000000000.0)
     );
 
     if (sampleTime != nullptr) {
-        *sampleTime = gAnchorSampleTime + static_cast<Float64>(alignedFrames);
+        *sampleTime = anchorSampleTime + static_cast<Float64>(alignedFrames);
     }
     if (hostTime != nullptr) {
-        *hostTime = gAnchorHostTime + alignedHostOffset;
+        *hostTime = anchorHostTime + alignedHostOffset;
     }
     if (seed != nullptr) {
-        *seed = gZeroTimestampSeed;
+        *seed = gZeroTimestampSeed.load(std::memory_order_acquire);
     }
     return noErr;
 }

@@ -13,11 +13,11 @@ final class AudioSettingsStore {
     var errorMessage: String?
 
     private let hardware = AudioHardware()
-    private let configurationStore = DisplayVolumeConfigurationStore()
+    private var statusRefreshTask: Task<Void, Never>?
 
     init() {
-        configuration = configurationStore.load()
         refresh()
+        startDriverStatusRefresh()
     }
 
     var selectedTargetDevice: AudioDeviceInfo? {
@@ -31,13 +31,8 @@ final class AudioSettingsStore {
             virtualDevice = try hardware.virtualDevice()
             if virtualDevice != nil {
                 driverStatus = try hardware.driverStatus()
-                if configuration.targetOutputDeviceUID.isEmpty {
-                    let driverTargetUID = try hardware.driverTargetOutputUID()
-                    if !driverTargetUID.isEmpty {
-                        configuration.targetOutputDeviceUID = driverTargetUID
-                        persistConfiguration()
-                    }
-                }
+                configuration.targetOutputDeviceUID = try hardware.driverTargetOutputUID()
+                configuration.preferredBufferFrameSize = try hardware.driverPreferredBufferFrameSize()
             }
             errorMessage = nil
         } catch {
@@ -45,16 +40,45 @@ final class AudioSettingsStore {
         }
     }
 
+    private func startDriverStatusRefresh() {
+        statusRefreshTask?.cancel()
+        statusRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled else {
+                    return
+                }
+                guard let self else {
+                    return
+                }
+                self.refreshDriverStatus()
+            }
+        }
+    }
+
+    private func refreshDriverStatus() {
+        guard virtualDevice != nil, let status = try? hardware.driverStatus() else {
+            return
+        }
+        driverStatus = status
+    }
+
     func selectTargetDevice(_ uid: String) {
         configuration.targetOutputDeviceUID = uid
-        persistConfiguration()
         applyDriverConfiguration()
     }
 
     func setPreferredBufferFrameSize(_ value: Int) {
         configuration.preferredBufferFrameSize = value
-        persistConfiguration()
-        applyDriverConfiguration()
+        do {
+            try hardware.setPreferredBufferFrameSize(UInt32(value))
+            if let driverStatus = try? hardware.driverStatus() {
+                self.driverStatus = driverStatus
+            }
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     func setTargetAsSystemOutput() {
@@ -107,15 +131,6 @@ final class AudioSettingsStore {
             } catch {
                 errorMessage = error.localizedDescription
             }
-        }
-    }
-
-    private func persistConfiguration() {
-        do {
-            try configurationStore.save(configuration)
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
         }
     }
 }
