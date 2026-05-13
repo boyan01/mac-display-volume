@@ -141,7 +141,7 @@ public struct AudioHardware: Sendable {
 
     public func resetRelay() throws {
         let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
-        try setEmptyProperty(virtualDeviceID, Self.resetSelector)
+        try setNumberProperty(virtualDeviceID, Self.resetSelector, 1)
     }
 
     public func restartCoreAudio() async throws {
@@ -320,31 +320,6 @@ public struct AudioHardware: Sendable {
                 0,
                 nil,
                 UInt32(MemoryLayout<CFPropertyList>.size),
-                pointer
-            )
-        }
-        guard status == noErr else {
-            throw AudioHardwareError.propertyWrite(objectID, selector, kAudioObjectPropertyScopeGlobal, status)
-        }
-    }
-
-    private func setEmptyProperty(
-        _ objectID: AudioObjectID,
-        _ selector: AudioObjectPropertySelector
-    ) throws {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var unused: UInt8 = 0
-        let status = withUnsafePointer(to: &unused) { pointer in
-            AudioObjectSetPropertyData(
-                objectID,
-                &address,
-                0,
-                nil,
-                0,
                 pointer
             )
         }
