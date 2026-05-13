@@ -13,12 +13,12 @@ struct ContentView: View {
             Form {
                 Section("Driver") {
                     LabeledContent("Virtual device") {
-                        Text(store.virtualDevice?.name ?? "Not installed")
+                        Text(store.virtualDevice?.name ?? String(localized: "Not installed"))
                             .foregroundStyle(store.virtualDevice == nil ? .red : .secondary)
                     }
 
                     LabeledContent("Status") {
-                        Text(store.driverStatus.isRunning ? "Running" : "Idle")
+                        Text(store.driverStatus.isRunning ? String(localized: "Running") : String(localized: "Idle"))
                             .foregroundStyle(.secondary)
                     }
 
@@ -28,7 +28,13 @@ struct ContentView: View {
                     }
 
                     LabeledContent("Health") {
-                        Text("dropped \(store.driverStatus.droppedFrames), underruns \(store.driverStatus.underruns)")
+                        Text(
+                            String(
+                                format: String(localized: "dropped %lld, underruns %lld"),
+                                store.driverStatus.droppedFrames,
+                                store.driverStatus.underruns
+                            )
+                        )
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -48,7 +54,7 @@ struct ContentView: View {
                     }
 
                     LabeledContent("Current system output") {
-                        Text(store.defaultOutputDevice?.name ?? "Unknown")
+                        Text(store.defaultOutputDevice?.name ?? String(localized: "Unknown"))
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -65,12 +71,6 @@ struct ContentView: View {
                     }
                 }
 
-                Section("Startup") {
-                    Toggle("Launch at login", isOn: $store.configuration.launchAtLogin)
-                        .onChange(of: store.configuration.launchAtLogin) { _, newValue in
-                            store.setLaunchAtLogin(newValue)
-                        }
-                }
             }
             .formStyle(.grouped)
 

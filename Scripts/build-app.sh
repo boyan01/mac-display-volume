@@ -14,6 +14,8 @@ rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp "$ROOT_DIR/.build/release/DisplayVolume" "$MACOS_DIR/DisplayVolume"
+cp -R "$ROOT_DIR/Sources/DisplayVolumeApp/Resources/"*.lproj "$RESOURCES_DIR/"
+"$ROOT_DIR/Scripts/generate-app-icon.swift" "$RESOURCES_DIR/AppIcon.icns"
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -25,12 +27,21 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
   <string>en</string>
   <key>CFBundleExecutable</key>
   <string>DisplayVolume</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>tech.soit.MacDisplayVolume</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
   <string>Mac Display Volume</string>
+  <key>CFBundleDisplayName</key>
+  <string>Mac Display Volume</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>en</string>
+    <string>zh-Hans</string>
+  </array>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>

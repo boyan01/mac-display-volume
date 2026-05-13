@@ -1,7 +1,6 @@
 import DisplayVolumeCore
 import Foundation
 import Observation
-import ServiceManagement
 
 @MainActor
 @Observable
@@ -18,7 +17,6 @@ final class AudioSettingsStore {
 
     init() {
         configuration = configurationStore.load()
-        syncLaunchAtLoginStatus()
         refresh()
     }
 
@@ -59,26 +57,9 @@ final class AudioSettingsStore {
         applyDriverConfiguration()
     }
 
-    func setLaunchAtLogin(_ enabled: Bool) {
-        do {
-            if enabled {
-                try SMAppService.mainApp.register()
-            } else {
-                try SMAppService.mainApp.unregister()
-            }
-            syncLaunchAtLoginStatus(persist: true)
-            if enabled, SMAppService.mainApp.status == .requiresApproval {
-                errorMessage = "Launch at login requires approval in System Settings."
-            }
-        } catch {
-            syncLaunchAtLoginStatus(persist: true)
-            errorMessage = error.localizedDescription
-        }
-    }
-
     func setTargetAsSystemOutput() {
         guard !configuration.targetOutputDeviceUID.isEmpty else {
-            errorMessage = "Choose a target output device first."
+            errorMessage = String(localized: "Choose a target output device first.")
             return
         }
 
@@ -135,17 +116,6 @@ final class AudioSettingsStore {
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
-        }
-    }
-
-    private func syncLaunchAtLoginStatus(persist: Bool = false) {
-        let enabled = SMAppService.mainApp.status == .enabled
-        if configuration.launchAtLogin != enabled {
-            configuration.launchAtLogin = enabled
-        }
-
-        if persist {
-            persistConfiguration()
         }
     }
 }

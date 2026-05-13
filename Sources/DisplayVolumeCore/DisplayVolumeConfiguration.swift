@@ -3,16 +3,13 @@ import Foundation
 public struct DisplayVolumeConfiguration: Codable, Equatable, Sendable {
     public var targetOutputDeviceUID: String
     public var preferredBufferFrameSize: Int
-    public var launchAtLogin: Bool
 
     public init(
         targetOutputDeviceUID: String = "",
-        preferredBufferFrameSize: Int = 128,
-        launchAtLogin: Bool = false
+        preferredBufferFrameSize: Int = 128
     ) {
         self.targetOutputDeviceUID = targetOutputDeviceUID
         self.preferredBufferFrameSize = preferredBufferFrameSize
-        self.launchAtLogin = launchAtLogin
     }
 }
 

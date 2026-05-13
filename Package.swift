@@ -4,6 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "mac-display-volume",
+    defaultLocalization: "en",
     platforms: [
         .macOS(.v15),
     ],
@@ -17,7 +18,10 @@ let package = Package(
         .executableTarget(
             name: "DisplayVolumeApp",
             dependencies: ["DisplayVolumeCore"],
-            path: "Sources/DisplayVolumeApp"
+            path: "Sources/DisplayVolumeApp",
+            resources: [
+                .process("Resources"),
+            ]
         ),
         .target(
             name: "DisplayVolumeCore",
