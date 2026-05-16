@@ -78,11 +78,16 @@ The app talks to the driver through device-scoped custom properties:
 The driver status string currently includes:
 
 ```text
-running=1,target=yes,priming=no,queuedFrames=512,queuedMS=10.67,bufferFrames=128,dropped=0,underruns=0,sampleRate=48000
+running=1,target=yes,priming=no,queuedFrames=512,queuedMS=10.67,bufferFrames=128,targetBufferFrames=512,targetBufferMS=10.67,targetIOFrames=512,targetIOMS=10.67,dropped=0,underruns=0,sampleRate=48000
 ```
 
 `DisplayVolume.app` polls this status so the UI can show whether the driver is
 idle, priming, or running.
+
+`queuedMS` is the relay's current extra queued latency. `targetBufferFrames` is
+the selected real output device's reported buffer frame size when the target
+starts, and `targetIOFrames` is the most recent frame count requested by the
+target device IOProc.
 
 ## Relay State Model
 

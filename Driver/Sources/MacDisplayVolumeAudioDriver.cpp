@@ -78,6 +78,8 @@ std::atomic<UInt64> gTargetStopGeneration { 0 };
 std::atomic_bool gTargetActive { false };
 std::atomic_bool gTargetRecoveryScheduled { false };
 std::atomic<UInt64> gLastTargetIOHostTime { 0 };
+std::atomic<UInt32> gTargetBufferFrames { 0 };
+std::atomic<UInt32> gTargetIOFrames { 0 };
 AudioDeviceID gTargetDevice = kAudioObjectUnknown;
 AudioDeviceIOProcID gTargetIOProcID = nullptr;
 CFStringRef gTargetUID = nullptr;
@@ -90,6 +92,8 @@ struct StateSnapshot {
     UInt64 underruns;
     bool targetAlive;
     bool relayPriming;
+    UInt32 targetBufferFrames;
+    UInt32 targetIOFrames;
 };
 
 AudioObjectPropertyAddress MakeAddress(AudioObjectPropertySelector selector,
@@ -499,6 +503,18 @@ Float64 DeviceNominalSampleRate(AudioDeviceID deviceID) {
     return status == noErr ? sampleRate : 0.0;
 }
 
+UInt32 DeviceBufferFrameSize(AudioDeviceID deviceID) {
+    if (deviceID == kAudioObjectUnknown) {
+        return 0;
+    }
+
+    AudioObjectPropertyAddress address = MakeAddress(kAudioDevicePropertyBufferFrameSize);
+    UInt32 frames = 0;
+    UInt32 size = sizeof(frames);
+    OSStatus status = AudioObjectGetPropertyData(deviceID, &address, 0, nullptr, &size, &frames);
+    return status == noErr ? frames : 0;
+}
+
 AudioDeviceID FirstNonVirtualOutputDevice() {
     AudioObjectPropertyAddress address = MakeAddress(kAudioHardwarePropertyDevices);
     UInt32 size = 0;
@@ -609,6 +625,7 @@ OSStatus TargetDeviceIOProc(AudioObjectID,
         UInt32 channels = std::max<UInt32>(outOutputData->mBuffers[0].mNumberChannels, 1);
         frames = outOutputData->mBuffers[0].mDataByteSize / (sizeof(Float32) * channels);
     }
+    gTargetIOFrames.store(frames, std::memory_order_release);
     FillOutputBufferList(outOutputData, frames);
     return noErr;
 }
@@ -623,12 +640,16 @@ void StopTargetDevice() {
         gTargetDevice = kAudioObjectUnknown;
         gTargetIOProcID = nullptr;
         gTargetActive.store(false, std::memory_order_release);
+        gTargetBufferFrames.store(0, std::memory_order_release);
+        gTargetIOFrames.store(0, std::memory_order_release);
     }
 
     if (targetDevice != kAudioObjectUnknown && targetIOProcID != nullptr) {
         AudioDeviceStop(targetDevice, targetIOProcID);
         AudioDeviceDestroyIOProcID(targetDevice, targetIOProcID);
     }
+    gTargetBufferFrames.store(0, std::memory_order_release);
+    gTargetIOFrames.store(0, std::memory_order_release);
 }
 
 void StartTargetDevice() {
@@ -676,6 +697,7 @@ void StartTargetDevice() {
     if (!IsSupportedTargetSampleRate(DeviceNominalSampleRate(target))) {
         return;
     }
+    UInt32 targetBufferFrames = DeviceBufferFrameSize(target);
 
     AudioDeviceIOProcID ioProcID = nullptr;
     if (AudioDeviceCreateIOProcID(target, TargetDeviceIOProc, nullptr, &ioProcID) != noErr) {
@@ -694,6 +716,8 @@ void StartTargetDevice() {
             gTargetDevice = target;
             gTargetIOProcID = ioProcID;
             gLastTargetIOHostTime.store(AudioGetCurrentHostTime(), std::memory_order_release);
+            gTargetBufferFrames.store(targetBufferFrames, std::memory_order_release);
+            gTargetIOFrames.store(0, std::memory_order_release);
             gTargetActive.store(true, std::memory_order_release);
         } else {
             shouldStop = true;
@@ -796,6 +820,8 @@ StateSnapshot SnapshotLocked() {
         gUnderruns.load(std::memory_order_acquire),
         gTargetActive.load(std::memory_order_acquire),
         gRelayPriming.load(std::memory_order_acquire),
+        gTargetBufferFrames.load(std::memory_order_acquire),
+        gTargetIOFrames.load(std::memory_order_acquire),
     };
 }
 
@@ -803,17 +829,23 @@ CFStringRef CopyStatusString() {
     std::lock_guard<std::mutex> lock(gStateMutex);
     StateSnapshot snapshot = SnapshotLocked();
     double queuedMS = snapshot.sampleRate > 0 ? (static_cast<double>(snapshot.queuedFrames) / snapshot.sampleRate) * 1000.0 : 0.0;
+    double targetBufferMS = snapshot.sampleRate > 0 ? (static_cast<double>(snapshot.targetBufferFrames) / snapshot.sampleRate) * 1000.0 : 0.0;
+    double targetIOMS = snapshot.sampleRate > 0 ? (static_cast<double>(snapshot.targetIOFrames) / snapshot.sampleRate) * 1000.0 : 0.0;
     char buffer[512];
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "running=%u,target=%s,priming=%s,queuedFrames=%u,queuedMS=%.2f,bufferFrames=%u,dropped=%llu,underruns=%llu,sampleRate=%.0f",
+        "running=%u,target=%s,priming=%s,queuedFrames=%u,queuedMS=%.2f,bufferFrames=%u,targetBufferFrames=%u,targetBufferMS=%.2f,targetIOFrames=%u,targetIOMS=%.2f,dropped=%llu,underruns=%llu,sampleRate=%.0f",
         gRunningClients.load(std::memory_order_acquire),
         snapshot.targetAlive ? "yes" : "no",
         snapshot.relayPriming ? "yes" : "no",
         snapshot.queuedFrames,
         queuedMS,
         snapshot.preferredBufferFrames,
+        snapshot.targetBufferFrames,
+        targetBufferMS,
+        snapshot.targetIOFrames,
+        targetIOMS,
         snapshot.droppedFrames,
         snapshot.underruns,
         snapshot.sampleRate

@@ -33,6 +33,7 @@ private struct Options {
     var configureTarget = false
     var requireTarget = false
     var setDefaultVirtual = false
+    var setDefaultTarget = false
     var reset = false
     var quiet = false
 }
@@ -49,24 +50,30 @@ private func parseOptions() throws -> Options {
             options.requireTarget = true
         case "--set-default-virtual":
             options.setDefaultVirtual = true
+        case "--set-default-target":
+            options.setDefaultTarget = true
         case "--reset":
             options.reset = true
         case "--quiet":
             options.quiet = true
         case "--help", "-h":
             throw ProbeError.help("""
-            Usage: DriverProbe [--mutating] [--configure-target] [--require-target] [--set-default-virtual] [--reset] [--quiet]
+            Usage: DriverProbe [--mutating] [--configure-target] [--require-target] [--set-default-virtual|--set-default-target] [--reset] [--quiet]
 
             --mutating            Exercise writable HAL properties by writing current values back.
             --configure-target    Set the driver target to the first non-virtual 48 kHz output.
             --require-target      Fail if no non-virtual 48 kHz output target is available.
             --set-default-virtual Set Mac Display Volume as the system default output.
+            --set-default-target  Set the first non-virtual 48 kHz target as the system default output.
             --reset               Reset relay health counters before reading status.
             --quiet               Print only failures.
             """)
         default:
             throw ProbeError.usage("Unknown argument: \(argument)")
         }
+    }
+    if options.setDefaultVirtual && options.setDefaultTarget {
+        throw ProbeError.usage("--set-default-virtual and --set-default-target cannot be used together.")
     }
     return options
 }
@@ -334,6 +341,13 @@ private func runProbe(options: Options) throws {
         try setDefaultOutput(virtualDevice.id)
     }
 
+    if options.setDefaultTarget {
+        guard let target = supportedTargets.first else {
+            throw ProbeError.missingSupportedTarget
+        }
+        try setDefaultOutput(target.id)
+    }
+
     if options.reset {
         try hardware.resetRelay()
     }
@@ -359,7 +373,7 @@ private func runProbe(options: Options) throws {
         print("virtualDevice=\(virtualDevice.id) name=\"\(virtualDevice.name)\" uid=\"\(virtualDevice.uid)\"")
         print("outputs=\(outputs.count) supportedTargets=\(supportedTargets.count)")
         print("stream=\(outputStream)")
-        print("status running=\(status.isRunning) target=\(status.targetAlive) priming=\(status.isPriming) queued=\(status.queuedFrames) dropped=\(status.droppedFrames) underruns=\(status.underruns)")
+        print("status running=\(status.isRunning) target=\(status.targetAlive) priming=\(status.isPriming) queued=\(status.queuedFrames) queuedMS=\(String(format: "%.2f", status.queuedMilliseconds)) buffer=\(status.bufferFrames) targetBuffer=\(status.targetBufferFrames) targetBufferMS=\(String(format: "%.2f", status.targetBufferMilliseconds)) targetIO=\(status.targetIOFrames) targetIOMS=\(String(format: "%.2f", status.targetIOMilliseconds)) dropped=\(status.droppedFrames) underruns=\(status.underruns)")
     }
 }
 

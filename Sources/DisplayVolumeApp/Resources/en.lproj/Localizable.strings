@@ -1,6 +1,7 @@
 "64 frames" = "64 frames";
 "128 frames" = "128 frames";
 "256 frames" = "256 frames";
+"%lld frames / %.1f ms" = "%lld frames / %.1f ms";
 "Apply Driver Config" = "Apply Driver Config";
 "Buffer" = "Buffer";
 "Choose a device" = "Choose a device";
@@ -39,7 +40,9 @@
 "Status" = "Status";
 "System output" = "System output";
 "Target" = "Target";
+"Target buffer" = "Target buffer";
 "Target display audio" = "Target display audio";
+"Target IO" = "Target IO";
 "Target alive: %@" = "Target alive: %@";
 "Target: %@" = "Target: %@";
 "Unknown" = "Unknown";

@@ -171,6 +171,8 @@ struct ContentView: View {
                 }
 
                 infoRow("Buffer", value: "\(store.configuration.preferredBufferFrameSize) frames", systemImage: "rectangle.compress.vertical")
+                infoRow("Target buffer", value: targetBufferText, systemImage: "rectangle.stack")
+                infoRow("Target IO", value: targetIOText, systemImage: "waveform")
                 explainedInfoRow(
                     "Queued latency",
                     value: latencyText,
@@ -356,6 +358,27 @@ struct ContentView: View {
 
     private var latencyText: String {
         String(format: "%.1f ms", store.driverStatus.queuedMilliseconds)
+    }
+
+    private var targetBufferText: String {
+        frameLatencyText(
+            frames: store.driverStatus.targetBufferFrames,
+            milliseconds: store.driverStatus.targetBufferMilliseconds
+        )
+    }
+
+    private var targetIOText: String {
+        frameLatencyText(
+            frames: store.driverStatus.targetIOFrames,
+            milliseconds: store.driverStatus.targetIOMilliseconds
+        )
+    }
+
+    private func frameLatencyText(frames: Int, milliseconds: Double) -> String {
+        guard frames > 0 else {
+            return String(localized: "Unknown")
+        }
+        return String(format: String(localized: "%lld frames / %.1f ms"), Int64(frames), milliseconds)
     }
 
     private var latencyColor: Color {

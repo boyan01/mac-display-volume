@@ -36,7 +36,7 @@ Expected proof:
 
 ```text
 DriverProbe OK
-status running=false target=false priming=true queued=0 dropped=0 underruns=0
+status running=false target=false priming=true queued=0 queuedMS=0.00 buffer=128 targetBuffer=0 targetBufferMS=0.00 targetIO=0 targetIOMS=0.00 dropped=0 underruns=0
 ```
 
 `system_profiler SPAudioDataType` should list `Mac Display Volume`. On Tahoe VMs, `lsof -p $(pgrep coreaudiod)` may not show the bundle even when CoreAudio enumeration and `DriverProbe` pass; treat this as a warning, not a hard failure.
@@ -94,12 +94,14 @@ wait
 `DriverProbe` prints:
 
 ```text
-status running=<bool> target=<bool> priming=<bool> queued=<frames> dropped=<frames> underruns=<count>
+status running=<bool> target=<bool> priming=<bool> queued=<frames> queuedMS=<ms> buffer=<frames> targetBuffer=<frames> targetBufferMS=<ms> targetIO=<frames> targetIOMS=<ms> dropped=<frames> underruns=<count>
 ```
 
 Use these rules:
 
 - `running=true target=true priming=false` means the virtual output and relay target are active.
+- `queuedMS` is the relay's current extra queued latency.
+- `targetBufferMS` and `targetIOMS` estimate the selected real output device's buffer and current IOProc pull size.
 - `running=false target=true` shortly after playback can be expected when the driver keeps target warm during the idle grace period.
 - `running=false target=false` after the idle grace period means the real target was released.
 - `dropped` should not grow during steady-state continuous playback.

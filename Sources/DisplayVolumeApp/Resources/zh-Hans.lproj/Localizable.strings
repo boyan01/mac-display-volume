@@ -1,6 +1,7 @@
 "64 frames" = "64 帧";
 "128 frames" = "128 帧";
 "256 frames" = "256 帧";
+"%lld frames / %.1f ms" = "%lld 帧 / %.1f ms";
 "Apply Driver Config" = "应用驱动配置";
 "Buffer" = "缓冲";
 "Choose a device" = "选择设备";
@@ -39,7 +40,9 @@
 "Status" = "状态";
 "System output" = "系统输出";
 "Target" = "目标";
+"Target buffer" = "目标缓冲";
 "Target display audio" = "目标显示器音频";
+"Target IO" = "目标 IO";
 "Target alive: %@" = "目标在线：%@";
 "Target: %@" = "目标：%@";
 "Unknown" = "未知";
