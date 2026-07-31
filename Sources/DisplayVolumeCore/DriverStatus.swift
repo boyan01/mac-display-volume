@@ -3,6 +3,9 @@ import Foundation
 public struct DriverStatus: Equatable, Sendable {
     public var isRunning: Bool
     public var targetAlive: Bool
+    public var targetAvailable: Bool
+    public var devicePublished: Bool
+    public var willRestoreDefaultOutput: Bool
     public var isPriming: Bool
     public var queuedFrames: Int
     public var queuedMilliseconds: Double
@@ -18,6 +21,9 @@ public struct DriverStatus: Equatable, Sendable {
     public init(
         isRunning: Bool = false,
         targetAlive: Bool = false,
+        targetAvailable: Bool = false,
+        devicePublished: Bool = false,
+        willRestoreDefaultOutput: Bool = false,
         isPriming: Bool = false,
         queuedFrames: Int = 0,
         queuedMilliseconds: Double = 0,
@@ -32,6 +38,9 @@ public struct DriverStatus: Equatable, Sendable {
     ) {
         self.isRunning = isRunning
         self.targetAlive = targetAlive
+        self.targetAvailable = targetAvailable
+        self.devicePublished = devicePublished
+        self.willRestoreDefaultOutput = willRestoreDefaultOutput
         self.isPriming = isPriming
         self.queuedFrames = queuedFrames
         self.queuedMilliseconds = queuedMilliseconds
@@ -56,6 +65,9 @@ public struct DriverStatus: Equatable, Sendable {
         return DriverStatus(
             isRunning: (Int(values["running"] ?? "0") ?? 0) > 0,
             targetAlive: values["target"] == "yes",
+            targetAvailable: values["available"] == "yes",
+            devicePublished: values["published"] == "yes",
+            willRestoreDefaultOutput: values["restoreDefault"] == "yes",
             isPriming: values["priming"] == "yes",
             queuedFrames: Int(values["queuedFrames"] ?? "0") ?? 0,
             queuedMilliseconds: Double(values["queuedMS"] ?? "0") ?? 0,

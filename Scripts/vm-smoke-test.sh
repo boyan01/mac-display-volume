@@ -6,13 +6,15 @@ DRIVER_TARGET="/Library/Audio/Plug-Ins/HAL/MacDisplayVolumeAudio.driver"
 REPORT_DIR="${TMPDIR:-/tmp}/mac-display-volume-smoke"
 SYSTEM_PROFILER_REPORT="$REPORT_DIR/system_profiler_audio.txt"
 LSOF_REPORT="$REPORT_DIR/coreaudiod_lsof.txt"
+PROBE_BUILD_DIR="$REPORT_DIR/swift-build"
 KEEP_INSTALLED=0
 REQUIRE_TARGET=0
 SET_DEFAULT_VIRTUAL=0
+TEST_TARGET_AVAILABILITY=0
 
 usage() {
   cat <<'EOF'
-Usage: Scripts/vm-smoke-test.sh [--keep-installed] [--require-target] [--set-default-virtual]
+Usage: Scripts/vm-smoke-test.sh [--keep-installed] [--require-target] [--set-default-virtual] [--test-target-availability]
 
 Run this inside a disposable macOS VM. The script installs the HAL driver,
 restarts coreaudiod, verifies CoreAudio enumeration/loading, runs DriverProbe,
@@ -21,6 +23,8 @@ and uninstalls the driver unless --keep-installed is passed.
 --keep-installed       Leave the driver installed after the smoke test.
 --require-target       Fail unless a non-virtual 48 kHz output target exists.
 --set-default-virtual  Set Mac Display Volume as the guest default output.
+--test-target-availability
+                       Verify withdrawal, republication, and default-output restoration.
 EOF
 }
 
@@ -34,6 +38,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --set-default-virtual)
       SET_DEFAULT_VIRTUAL=1
+      ;;
+    --test-target-availability)
+      TEST_TARGET_AVAILABILITY=1
       ;;
     --help|-h)
       usage
@@ -86,14 +93,23 @@ log "building driver"
 DRIVER_PATH="$("$ROOT_DIR/Scripts/build-driver.sh")"
 
 log "building DriverProbe"
-swift build --package-path "$ROOT_DIR" --product DriverProbe >/dev/null
-PROBE="$ROOT_DIR/.build/debug/DriverProbe"
+rm -rf "$PROBE_BUILD_DIR"
+swift build --package-path "$ROOT_DIR" --scratch-path "$PROBE_BUILD_DIR" --product DriverProbe >/dev/null
+PROBE="$PROBE_BUILD_DIR/debug/DriverProbe"
 
 log "installing driver into $DRIVER_TARGET"
 sudo rm -rf "$DRIVER_TARGET"
 sudo ditto "$DRIVER_PATH" "$DRIVER_TARGET"
 sudo chown -R root:wheel "$DRIVER_TARGET"
 restart_coreaudiod
+
+log "configuring the fixed target"
+INITIAL_PROBE_ARGS="--configure-target"
+if [ "$REQUIRE_TARGET" -eq 1 ]; then
+  INITIAL_PROBE_ARGS="$INITIAL_PROBE_ARGS --require-target"
+fi
+# shellcheck disable=SC2086
+"$PROBE" $INITIAL_PROBE_ARGS
 
 log "checking system_profiler enumeration"
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
@@ -124,6 +140,9 @@ if [ "$REQUIRE_TARGET" -eq 1 ]; then
 fi
 if [ "$SET_DEFAULT_VIRTUAL" -eq 1 ]; then
   PROBE_ARGS="$PROBE_ARGS --set-default-virtual"
+fi
+if [ "$TEST_TARGET_AVAILABILITY" -eq 1 ]; then
+  PROBE_ARGS="$PROBE_ARGS --test-target-availability"
 fi
 
 log "running DriverProbe"

@@ -34,6 +34,7 @@ private struct Options {
     var requireTarget = false
     var setDefaultVirtual = false
     var setDefaultTarget = false
+    var testTargetAvailability = false
     var reset = false
     var quiet = false
 }
@@ -52,19 +53,23 @@ private func parseOptions() throws -> Options {
             options.setDefaultVirtual = true
         case "--set-default-target":
             options.setDefaultTarget = true
+        case "--test-target-availability":
+            options.testTargetAvailability = true
         case "--reset":
             options.reset = true
         case "--quiet":
             options.quiet = true
         case "--help", "-h":
             throw ProbeError.help("""
-            Usage: DriverProbe [--mutating] [--configure-target] [--require-target] [--set-default-virtual|--set-default-target] [--reset] [--quiet]
+            Usage: DriverProbe [--mutating] [--configure-target] [--require-target] [--set-default-virtual|--set-default-target] [--test-target-availability] [--reset] [--quiet]
 
             --mutating            Exercise writable HAL properties by writing current values back.
             --configure-target    Set the driver target to the first non-virtual 48 kHz output.
             --require-target      Fail if no non-virtual 48 kHz output target is available.
             --set-default-virtual Set Mac Display Volume as the system default output.
             --set-default-target  Set the first non-virtual 48 kHz target as the system default output.
+            --test-target-availability
+                                  Verify virtual-device withdrawal, republication, and default-output restoration.
             --reset               Reset relay health counters before reading status.
             --quiet               Print only failures.
             """)
@@ -215,6 +220,118 @@ private func setDefaultOutput(_ deviceID: AudioDeviceID) throws {
     )
 }
 
+private func waitForVirtualDevice(
+    hardware: AudioHardware,
+    published: Bool,
+    timeout: TimeInterval = 8
+) throws -> AudioDeviceInfo? {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        let virtualDevice = try hardware.virtualDevice()
+        if (virtualDevice != nil) == published {
+            return virtualDevice
+        }
+        Thread.sleep(forTimeInterval: 0.1)
+    } while Date() < deadline
+
+    throw ProbeError.unexpected(
+        published
+            ? "Mac Display Volume was not published after its target became available."
+            : "Mac Display Volume remained published after its target became unavailable."
+    )
+}
+
+private func waitForSystemOutput(
+    selector: AudioObjectPropertySelector,
+    deviceID: AudioDeviceID,
+    timeout: TimeInterval = 8
+) throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        let currentDevice = try property(
+            objectID: AudioObjectID(kAudioObjectSystemObject),
+            selector: selector,
+            as: AudioDeviceID.self
+        )
+        if currentDevice == deviceID {
+            return
+        }
+        Thread.sleep(forTimeInterval: 0.1)
+    } while Date() < deadline
+    throw ProbeError.unexpected("\(selector.fourCC) did not become device \(deviceID).")
+}
+
+private func waitForDriverStatus(
+    hardware: AudioHardware,
+    timeout: TimeInterval = 8,
+    matching predicate: (DriverStatus) -> Bool
+) throws -> DriverStatus {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        let status = try hardware.driverStatus()
+        if predicate(status) {
+            return status
+        }
+        Thread.sleep(forTimeInterval: 0.1)
+    } while Date() < deadline
+    throw ProbeError.unexpected("Driver status did not reach the expected state.")
+}
+
+private func exerciseTargetAvailability(
+    hardware: AudioHardware,
+    target: AudioDeviceInfo,
+    virtualDevice: AudioDeviceInfo
+) throws -> AudioDeviceInfo {
+    try setDefaultOutput(virtualDevice.id)
+    try waitForSystemOutput(
+        selector: kAudioHardwarePropertyDefaultOutputDevice,
+        deviceID: virtualDevice.id
+    )
+    try waitForSystemOutput(
+        selector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+        deviceID: virtualDevice.id
+    )
+
+    try hardware.setDriverTargetOutputUID("tech.soit.MacDisplayVolume.UnavailableTestTarget")
+    _ = try waitForVirtualDevice(hardware: hardware, published: false)
+    let unavailableStatus = try waitForDriverStatus(hardware: hardware) {
+        !$0.targetAvailable && !$0.devicePublished && $0.willRestoreDefaultOutput
+    }
+    guard !unavailableStatus.targetAvailable,
+          !unavailableStatus.devicePublished,
+          unavailableStatus.willRestoreDefaultOutput else {
+        throw ProbeError.unexpected(
+            "Driver did not preserve default-output restoration intent while the target was unavailable."
+        )
+    }
+
+    try hardware.setDriverTargetOutputUID(target.uid)
+    guard let restoredVirtualDevice = try waitForVirtualDevice(hardware: hardware, published: true) else {
+        throw ProbeError.missingVirtualDevice
+    }
+    try waitForSystemOutput(
+        selector: kAudioHardwarePropertyDefaultOutputDevice,
+        deviceID: restoredVirtualDevice.id
+    )
+    try waitForSystemOutput(
+        selector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+        deviceID: restoredVirtualDevice.id
+    )
+    let restoredStatus = try waitForDriverStatus(hardware: hardware) {
+        $0.targetAvailable && $0.devicePublished && !$0.willRestoreDefaultOutput
+    }
+    guard restoredStatus.targetAvailable,
+          restoredStatus.devicePublished,
+          !restoredStatus.willRestoreDefaultOutput else {
+        throw ProbeError.unexpected(
+            "Driver restoration status was available=\(restoredStatus.targetAvailable), " +
+            "published=\(restoredStatus.devicePublished), " +
+            "restoreDefault=\(restoredStatus.willRestoreDefaultOutput)."
+        )
+    }
+    return restoredVirtualDevice
+}
+
 private func exerciseStreamProperties(deviceID: AudioObjectID, streamID: AudioObjectID, mutating: Bool) throws {
     let isActive = try property(
         objectID: streamID,
@@ -309,19 +426,8 @@ private func exerciseControls(deviceID: AudioObjectID, mutating: Bool) throws {
 
 private func runProbe(options: Options) throws {
     let hardware = AudioHardware()
-    let outputs = try hardware.outputDevices()
-    guard let virtualDevice = outputs.first(where: { $0.uid == AudioHardware.virtualDeviceUID }) else {
-        throw ProbeError.missingVirtualDevice
-    }
-
-    let translatedID = try translateUID(AudioHardware.virtualDeviceUID)
-    guard translatedID == virtualDevice.id else {
-        throw ProbeError.unexpected(
-            "UID translation returned \(translatedID), but device list returned \(virtualDevice.id)."
-        )
-    }
-
-    let supportedTargets = outputs.filter {
+    let initialOutputs = try hardware.outputDevices()
+    let supportedTargets = initialOutputs.filter {
         $0.uid != AudioHardware.virtualDeviceUID &&
         AudioHardware.isSupportedTargetSampleRate($0.nominalSampleRate)
     }
@@ -337,6 +443,17 @@ private func runProbe(options: Options) throws {
         try hardware.applyDriverConfiguration(configuration)
     }
 
+    guard var virtualDevice = try waitForVirtualDevice(hardware: hardware, published: true) else {
+        throw ProbeError.missingVirtualDevice
+    }
+    var outputs = try hardware.outputDevices()
+    let translatedID = try translateUID(AudioHardware.virtualDeviceUID)
+    guard translatedID == virtualDevice.id else {
+        throw ProbeError.unexpected(
+            "UID translation returned \(translatedID), but device list returned \(virtualDevice.id)."
+        )
+    }
+
     if options.setDefaultVirtual {
         try setDefaultOutput(virtualDevice.id)
     }
@@ -346,6 +463,18 @@ private func runProbe(options: Options) throws {
             throw ProbeError.missingSupportedTarget
         }
         try setDefaultOutput(target.id)
+    }
+
+    if options.testTargetAvailability {
+        guard let target = supportedTargets.first else {
+            throw ProbeError.missingSupportedTarget
+        }
+        virtualDevice = try exerciseTargetAvailability(
+            hardware: hardware,
+            target: target,
+            virtualDevice: virtualDevice
+        )
+        outputs = try hardware.outputDevices()
     }
 
     if options.reset {
@@ -373,7 +502,7 @@ private func runProbe(options: Options) throws {
         print("virtualDevice=\(virtualDevice.id) name=\"\(virtualDevice.name)\" uid=\"\(virtualDevice.uid)\"")
         print("outputs=\(outputs.count) supportedTargets=\(supportedTargets.count)")
         print("stream=\(outputStream)")
-        print("status running=\(status.isRunning) target=\(status.targetAlive) priming=\(status.isPriming) queued=\(status.queuedFrames) queuedMS=\(String(format: "%.2f", status.queuedMilliseconds)) buffer=\(status.bufferFrames) targetBuffer=\(status.targetBufferFrames) targetBufferMS=\(String(format: "%.2f", status.targetBufferMilliseconds)) targetIO=\(status.targetIOFrames) targetIOMS=\(String(format: "%.2f", status.targetIOMilliseconds)) dropped=\(status.droppedFrames) underruns=\(status.underruns)")
+        print("status running=\(status.isRunning) target=\(status.targetAlive) available=\(status.targetAvailable) published=\(status.devicePublished) restoreDefault=\(status.willRestoreDefaultOutput) priming=\(status.isPriming) queued=\(status.queuedFrames) queuedMS=\(String(format: "%.2f", status.queuedMilliseconds)) buffer=\(status.bufferFrames) targetBuffer=\(status.targetBufferFrames) targetBufferMS=\(String(format: "%.2f", status.targetBufferMilliseconds)) targetIO=\(status.targetIOFrames) targetIOMS=\(String(format: "%.2f", status.targetIOMilliseconds)) dropped=\(status.droppedFrames) underruns=\(status.underruns)")
     }
 }
 

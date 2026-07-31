@@ -2,11 +2,13 @@
 "128 frames" = "128 frames";
 "256 frames" = "256 frames";
 "%lld frames / %.1f ms" = "%lld frames / %.1f ms";
+"%@ (Disconnected)" = "%@ (Disconnected)";
 "Apply Driver Config" = "Apply Driver Config";
 "Buffer" = "Buffer";
 "Choose a device" = "Choose a device";
 "Choose a target output device first." = "Choose a target output device first.";
 "Connected" = "Connected";
+"Disconnected" = "Disconnected";
 "Current system output" = "Current system output";
 "Display audio relay" = "Display audio relay";
 "Driver" = "Driver";
@@ -14,6 +16,7 @@
 "Driver is not installed." = "Driver is not installed.";
 "Driver is priming the relay buffer." = "Driver is priming the relay buffer.";
 "Driver is working. You can quit the app anytime." = "Driver is working. You can quit the app anytime.";
+"The target output is disconnected. The virtual device will return automatically." = "The target output is disconnected. The virtual device will return automatically.";
 "Dropped" = "Dropped";
 "Health" = "Health";
 "Idle" = "Idle";
@@ -43,6 +46,7 @@
 "Target buffer" = "Target buffer";
 "Target display audio" = "Target display audio";
 "Target IO" = "Target IO";
+"Temporarily unavailable" = "Temporarily unavailable";
 "Target alive: %@" = "Target alive: %@";
 "Target: %@" = "Target: %@";
 "Unknown" = "Unknown";

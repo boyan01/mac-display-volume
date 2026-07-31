@@ -42,6 +42,8 @@ constexpr UInt32 kDefaultBufferFrames = 128;
 constexpr UInt32 kZeroTimestampPeriodFrames = 16384;
 constexpr int64_t kTargetRecoveryDelayNanos = 1000000000;
 constexpr int64_t kTargetIdleStopDelayNanos = 2000000000;
+constexpr int64_t kDefaultOutputRestoreDelayNanos = 250000000;
+constexpr UInt32 kDefaultOutputRestoreAttempts = 8;
 constexpr UInt64 kTargetStallRecoveryNanos = 1000000000;
 constexpr Float64 kDefaultSampleRate = 48000.0;
 constexpr Float32 kMinDB = -60.0f;
@@ -65,7 +67,11 @@ std::atomic<Float32> gVolumeRight { 1.0f };
 std::atomic_bool gMute { false };
 std::atomic_bool gStreamOutputActive { true };
 std::atomic_bool gRelayPriming { true };
-bool gBoxAcquired = true;
+std::atomic_bool gBoxAcquired { true };
+std::atomic_bool gTargetAvailable { false };
+std::atomic_bool gDevicePublished { false };
+std::atomic_bool gRestoreDefaultOutput { false };
+std::atomic_bool gRestoreDefaultSystemOutput { false };
 std::atomic<UInt64> gZeroTimestampSeed { 1 };
 std::atomic<UInt64> gAnchorHostTime { 0 };
 std::atomic<Float64> gAnchorSampleTime { 0.0 };
@@ -82,6 +88,7 @@ std::atomic<UInt32> gTargetBufferFrames { 0 };
 std::atomic<UInt32> gTargetIOFrames { 0 };
 AudioDeviceID gTargetDevice = kAudioObjectUnknown;
 AudioDeviceIOProcID gTargetIOProcID = nullptr;
+AudioDeviceID gObservedTargetDevice = kAudioObjectUnknown;
 CFStringRef gTargetUID = nullptr;
 
 struct StateSnapshot {
@@ -91,6 +98,9 @@ struct StateSnapshot {
     UInt64 droppedFrames;
     UInt64 underruns;
     bool targetAlive;
+    bool targetAvailable;
+    bool devicePublished;
+    bool restoreDefaultOutput;
     bool relayPriming;
     UInt32 targetBufferFrames;
     UInt32 targetIOFrames;
@@ -319,7 +329,8 @@ UInt32 PrebufferFramesFor(UInt32 requestedFrames) {
 void ScheduleTargetRecovery();
 
 bool TargetNeedsRecovery() {
-    if (gRunningClients.load(std::memory_order_acquire) == 0) {
+    if (!gTargetAvailable.load(std::memory_order_acquire) ||
+        gRunningClients.load(std::memory_order_acquire) == 0) {
         return false;
     }
 
@@ -466,18 +477,6 @@ void FillOutputBufferList(AudioBufferList *outOutputData, UInt32 frames) {
     }
 }
 
-CFStringRef CopyDeviceUID(AudioDeviceID deviceID) {
-    if (deviceID == kAudioObjectUnknown) {
-        return nullptr;
-    }
-
-    AudioObjectPropertyAddress address = MakeAddress(kAudioDevicePropertyDeviceUID);
-    CFStringRef uid = nullptr;
-    UInt32 size = sizeof(uid);
-    OSStatus status = AudioObjectGetPropertyData(deviceID, &address, 0, nullptr, &size, &uid);
-    return status == noErr ? uid : nullptr;
-}
-
 AudioDeviceID DeviceIDForUID(CFStringRef uid) {
     if (uid == nullptr) {
         return kAudioObjectUnknown;
@@ -515,56 +514,66 @@ UInt32 DeviceBufferFrameSize(AudioDeviceID deviceID) {
     return status == noErr ? frames : 0;
 }
 
-AudioDeviceID FirstNonVirtualOutputDevice() {
-    AudioObjectPropertyAddress address = MakeAddress(kAudioHardwarePropertyDevices);
+UInt32 DeviceOutputChannelCount(AudioDeviceID deviceID) {
+    if (deviceID == kAudioObjectUnknown) {
+        return 0;
+    }
+
+    AudioObjectPropertyAddress address = MakeAddress(
+        kAudioDevicePropertyStreamConfiguration,
+        kAudioDevicePropertyScopeOutput
+    );
     UInt32 size = 0;
-    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &address, 0, nullptr, &size) != noErr) {
-        return kAudioObjectUnknown;
+    if (AudioObjectGetPropertyDataSize(deviceID, &address, 0, nullptr, &size) != noErr || size == 0) {
+        return 0;
     }
 
-    std::vector<AudioDeviceID> devices(size / sizeof(AudioDeviceID));
-    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, nullptr, &size, devices.data()) != noErr) {
-        return kAudioObjectUnknown;
+    std::vector<std::byte> storage(size);
+    if (AudioObjectGetPropertyData(deviceID, &address, 0, nullptr, &size, storage.data()) != noErr) {
+        return 0;
     }
 
-    for (AudioDeviceID deviceID : devices) {
-        CFStringRef uid = CopyDeviceUID(deviceID);
-        if (uid == nullptr) {
-            continue;
-        }
-        bool isSelf = IsVirtualDeviceUID(uid);
-        CFRelease(uid);
-        if (isSelf) {
-            continue;
-        }
+    UInt32 channels = 0;
+    const AudioBufferList *buffers = reinterpret_cast<const AudioBufferList *>(storage.data());
+    for (UInt32 index = 0; index < buffers->mNumberBuffers; ++index) {
+        channels += buffers->mBuffers[index].mNumberChannels;
+    }
+    return channels;
+}
 
-        AudioObjectPropertyAddress streamAddress = MakeAddress(
-            kAudioDevicePropertyStreamConfiguration,
-            kAudioDevicePropertyScopeOutput
-        );
-        UInt32 streamSize = 0;
-        if (AudioObjectGetPropertyDataSize(deviceID, &streamAddress, 0, nullptr, &streamSize) != noErr || streamSize == 0) {
-            continue;
-        }
-
-        std::vector<std::byte> storage(streamSize);
-        if (AudioObjectGetPropertyData(deviceID, &streamAddress, 0, nullptr, &streamSize, storage.data()) != noErr) {
-            continue;
-        }
-        const AudioBufferList *buffers = reinterpret_cast<const AudioBufferList *>(storage.data());
-        for (UInt32 index = 0; index < buffers->mNumberBuffers; ++index) {
-            if (buffers->mBuffers[index].mNumberChannels > 0) {
-                return deviceID;
-            }
-        }
+bool DeviceIsAlive(AudioDeviceID deviceID) {
+    if (deviceID == kAudioObjectUnknown) {
+        return false;
     }
 
-    return kAudioObjectUnknown;
+    AudioObjectPropertyAddress address = MakeAddress(kAudioDevicePropertyDeviceIsAlive);
+    UInt32 alive = 0;
+    UInt32 size = sizeof(alive);
+    return AudioObjectGetPropertyData(deviceID, &address, 0, nullptr, &size, &alive) == noErr && alive != 0;
+}
+
+AudioDeviceID SystemDevice(AudioObjectPropertySelector selector) {
+    AudioObjectPropertyAddress address = MakeAddress(selector);
+    AudioDeviceID deviceID = kAudioObjectUnknown;
+    UInt32 size = sizeof(deviceID);
+    return AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, nullptr, &size, &deviceID) == noErr
+        ? deviceID
+        : kAudioObjectUnknown;
+}
+
+bool SetSystemDevice(AudioObjectPropertySelector selector, AudioDeviceID deviceID) {
+    AudioObjectPropertyAddress address = MakeAddress(selector);
+    UInt32 size = sizeof(deviceID);
+    return AudioObjectSetPropertyData(kAudioObjectSystemObject, &address, 0, nullptr, size, &deviceID) == noErr;
 }
 
 void SaveTargetUID(CFStringRef uid) {
-    if (gHost != nullptr && uid != nullptr) {
-        gHost->WriteToStorage(gHost, CFSTR("targetOutputDeviceUID"), uid);
+    if (gHost != nullptr) {
+        gHost->WriteToStorage(
+            gHost,
+            CFSTR("targetOutputDeviceUID"),
+            uid != nullptr ? uid : CFSTR("")
+        );
     }
 }
 
@@ -574,6 +583,38 @@ void SavePreferredBuffer(UInt32 preferredBufferFrames) {
         gHost->WriteToStorage(gHost, CFSTR("preferredBufferFrameSize"), number);
         CFRelease(number);
     }
+}
+
+void SaveDefaultOutputRestoreIntent() {
+    if (gHost == nullptr) {
+        return;
+    }
+    gHost->WriteToStorage(
+        gHost,
+        CFSTR("restoreDefaultOutput"),
+        gRestoreDefaultOutput.load(std::memory_order_acquire) ? kCFBooleanTrue : kCFBooleanFalse
+    );
+    gHost->WriteToStorage(
+        gHost,
+        CFSTR("restoreDefaultSystemOutput"),
+        gRestoreDefaultSystemOutput.load(std::memory_order_acquire) ? kCFBooleanTrue : kCFBooleanFalse
+    );
+}
+
+bool LoadStoredBoolean(CFStringRef key) {
+    if (gHost == nullptr) {
+        return false;
+    }
+
+    CFPropertyListRef data = nullptr;
+    bool value = false;
+    if (gHost->CopyFromStorage(gHost, key, &data) == noErr && data != nullptr) {
+        if (CFGetTypeID(data) == CFBooleanGetTypeID()) {
+            value = CFBooleanGetValue(static_cast<CFBooleanRef>(data));
+        }
+        CFRelease(data);
+    }
+    return value;
 }
 
 void LoadConfigurationFromStorage() {
@@ -610,6 +651,12 @@ void LoadConfigurationFromStorage() {
         }
         CFRelease(data);
     }
+
+    gRestoreDefaultOutput.store(LoadStoredBoolean(CFSTR("restoreDefaultOutput")), std::memory_order_release);
+    gRestoreDefaultSystemOutput.store(
+        LoadStoredBoolean(CFSTR("restoreDefaultSystemOutput")),
+        std::memory_order_release
+    );
 }
 
 OSStatus TargetDeviceIOProc(AudioObjectID,
@@ -661,37 +708,16 @@ void StartTargetDevice() {
         targetUID = gTargetUID != nullptr ? CFStringCreateCopy(nullptr, gTargetUID) : nullptr;
     }
 
-    AudioDeviceID target = kAudioObjectUnknown;
-    if (targetUID != nullptr) {
-        if (IsEmptyString(targetUID) || IsVirtualDeviceUID(targetUID)) {
+    if (targetUID == nullptr || IsEmptyString(targetUID) || IsVirtualDeviceUID(targetUID)) {
+        if (targetUID != nullptr) {
             CFRelease(targetUID);
-            return;
         }
-        target = DeviceIDForUID(targetUID);
-        CFRelease(targetUID);
-    } else {
-        target = FirstNonVirtualOutputDevice();
-        if (target != kAudioObjectUnknown) {
-            CFStringRef uid = CopyDeviceUID(target);
-            if (uid != nullptr) {
-                CFStringRef uidToSave = nullptr;
-                {
-                    std::lock_guard<std::mutex> lock(gStateMutex);
-                    if (gTargetUID != nullptr) {
-                        CFRelease(gTargetUID);
-                    }
-                    gTargetUID = uid;
-                    uidToSave = CFStringCreateCopy(nullptr, uid);
-                }
-                SaveTargetUID(uidToSave);
-                if (uidToSave != nullptr) {
-                    CFRelease(uidToSave);
-                }
-            }
-        }
+        return;
     }
+    AudioDeviceID target = DeviceIDForUID(targetUID);
+    CFRelease(targetUID);
 
-    if (target == kAudioObjectUnknown) {
+    if (!gTargetAvailable.load(std::memory_order_acquire) || target == kAudioObjectUnknown) {
         return;
     }
     if (!IsSupportedTargetSampleRate(DeviceNominalSampleRate(target))) {
@@ -751,14 +777,6 @@ void ScheduleStartTargetDevice() {
     });
 }
 
-void ScheduleStopTargetDevice() {
-    CancelScheduledTargetStart();
-    CancelScheduledTargetStop();
-    dispatch_async(gTargetQueue, ^{
-        StopTargetDevice();
-    });
-}
-
 void ScheduleIdleStopTargetDevice() {
     CancelScheduledTargetStart();
     UInt64 generation = gTargetStopGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -774,20 +792,168 @@ void ScheduleIdleStopTargetDevice() {
     });
 }
 
-void ScheduleRestartTargetDevice(bool shouldStartTarget) {
-    CancelScheduledTargetStart();
-    CancelScheduledTargetStop();
-    dispatch_async(gTargetQueue, ^{
+void NotifyDevicePublicationChanged() {
+    Notify(kObjectIDBox, kAudioBoxPropertyDeviceList);
+    Notify(kObjectIDPlugIn, kAudioPlugInPropertyDeviceList);
+    Notify(kObjectIDPlugIn, kAudioObjectPropertyOwnedObjects);
+    Notify(kObjectIDBox, kPropertyStatus);
+}
+
+void CaptureDefaultOutputRestoreIntent() {
+    AudioDeviceID virtualDevice = DeviceIDForUID(CFSTR("tech.soit.MacDisplayVolume.Device"));
+    gRestoreDefaultOutput.store(
+        virtualDevice != kAudioObjectUnknown &&
+            SystemDevice(kAudioHardwarePropertyDefaultOutputDevice) == virtualDevice,
+        std::memory_order_release
+    );
+    gRestoreDefaultSystemOutput.store(
+        virtualDevice != kAudioObjectUnknown &&
+            SystemDevice(kAudioHardwarePropertyDefaultSystemOutputDevice) == virtualDevice,
+        std::memory_order_release
+    );
+    SaveDefaultOutputRestoreIntent();
+}
+
+void ScheduleRestoreDefaultOutputs(UInt32 attempt = 0) {
+    if (!gRestoreDefaultOutput.load(std::memory_order_acquire) &&
+        !gRestoreDefaultSystemOutput.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kDefaultOutputRestoreDelayNanos), gTargetQueue, ^{
+        if (!gDevicePublished.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        AudioDeviceID virtualDevice = DeviceIDForUID(CFSTR("tech.soit.MacDisplayVolume.Device"));
+        bool changed = false;
+        if (virtualDevice != kAudioObjectUnknown &&
+            gRestoreDefaultOutput.load(std::memory_order_acquire) &&
+            SetSystemDevice(kAudioHardwarePropertyDefaultOutputDevice, virtualDevice)) {
+            gRestoreDefaultOutput.store(false, std::memory_order_release);
+            changed = true;
+        }
+        if (virtualDevice != kAudioObjectUnknown &&
+            gRestoreDefaultSystemOutput.load(std::memory_order_acquire) &&
+            SetSystemDevice(kAudioHardwarePropertyDefaultSystemOutputDevice, virtualDevice)) {
+            gRestoreDefaultSystemOutput.store(false, std::memory_order_release);
+            changed = true;
+        }
+        if (changed) {
+            SaveDefaultOutputRestoreIntent();
+            Notify(kObjectIDBox, kPropertyStatus);
+        }
+
+        if (attempt + 1 < kDefaultOutputRestoreAttempts &&
+            (gRestoreDefaultOutput.load(std::memory_order_acquire) ||
+             gRestoreDefaultSystemOutput.load(std::memory_order_acquire))) {
+            ScheduleRestoreDefaultOutputs(attempt + 1);
+        }
+    });
+}
+
+void UpdateDevicePublication(bool captureRestoreIntent) {
+    bool shouldPublish = gBoxAcquired.load(std::memory_order_acquire) &&
+                         gTargetAvailable.load(std::memory_order_acquire);
+    bool wasPublished = gDevicePublished.exchange(shouldPublish, std::memory_order_acq_rel);
+    if (wasPublished == shouldPublish) {
+        return;
+    }
+
+    if (!shouldPublish) {
+        if (captureRestoreIntent) {
+            CaptureDefaultOutputRestoreIntent();
+        }
+        CancelScheduledTargetStart();
         StopTargetDevice();
         {
             std::lock_guard<std::mutex> lock(gStateMutex);
             FlushRingLocked();
         }
-        Notify(kObjectIDDevice, kPropertyStatus);
-    });
-    if (shouldStartTarget) {
-        ScheduleStartTargetDevice();
     }
+
+    NotifyDevicePublicationChanged();
+    if (shouldPublish) {
+        ScheduleRestoreDefaultOutputs();
+        if (gRunningClients.load(std::memory_order_acquire) > 0) {
+            ScheduleStartTargetDevice();
+        }
+    }
+}
+
+void SetTargetAvailability(bool available) {
+    bool wasAvailable = gTargetAvailable.exchange(available, std::memory_order_acq_rel);
+    if (wasAvailable == available) {
+        return;
+    }
+    UpdateDevicePublication(!available);
+    Notify(kObjectIDBox, kPropertyStatus);
+    if (gDevicePublished.load(std::memory_order_acquire)) {
+        Notify(kObjectIDDevice, kAudioDevicePropertyDeviceIsAlive);
+        Notify(kObjectIDDevice, kPropertyStatus);
+    }
+}
+
+OSStatus TargetAvailabilityListener(AudioObjectID,
+                                    UInt32,
+                                    const AudioObjectPropertyAddress *,
+                                    void *);
+
+void SetTargetPropertyListeners(AudioDeviceID deviceID, bool enabled) {
+    if (deviceID == kAudioObjectUnknown) {
+        return;
+    }
+
+    std::array<AudioObjectPropertyAddress, 3> addresses {
+        MakeAddress(kAudioDevicePropertyDeviceIsAlive),
+        MakeAddress(kAudioDevicePropertyNominalSampleRate),
+        MakeAddress(kAudioDevicePropertyStreams, kAudioDevicePropertyScopeOutput),
+    };
+    for (auto &address : addresses) {
+        if (enabled) {
+            AudioObjectAddPropertyListener(deviceID, &address, TargetAvailabilityListener, nullptr);
+        } else {
+            AudioObjectRemovePropertyListener(deviceID, &address, TargetAvailabilityListener, nullptr);
+        }
+    }
+}
+
+void EvaluateTargetAvailability() {
+    CFStringRef targetUID = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        targetUID = gTargetUID != nullptr ? CFStringCreateCopy(nullptr, gTargetUID) : nullptr;
+    }
+
+    AudioDeviceID targetDevice = kAudioObjectUnknown;
+    if (targetUID != nullptr && !IsEmptyString(targetUID) && !IsVirtualDeviceUID(targetUID)) {
+        targetDevice = DeviceIDForUID(targetUID);
+    }
+    if (targetUID != nullptr) {
+        CFRelease(targetUID);
+    }
+
+    if (targetDevice != gObservedTargetDevice) {
+        SetTargetPropertyListeners(gObservedTargetDevice, false);
+        gObservedTargetDevice = targetDevice;
+        SetTargetPropertyListeners(gObservedTargetDevice, true);
+    }
+
+    bool available = targetDevice != kAudioObjectUnknown &&
+                     DeviceIsAlive(targetDevice) &&
+                     DeviceOutputChannelCount(targetDevice) > 0 &&
+                     IsSupportedTargetSampleRate(DeviceNominalSampleRate(targetDevice));
+    SetTargetAvailability(available);
+}
+
+OSStatus TargetAvailabilityListener(AudioObjectID,
+                                    UInt32,
+                                    const AudioObjectPropertyAddress *,
+                                    void *) {
+    dispatch_async(gTargetQueue, ^{
+        EvaluateTargetAvailability();
+    });
+    return noErr;
 }
 
 void ScheduleTargetRecovery() {
@@ -819,6 +985,10 @@ StateSnapshot SnapshotLocked() {
         gDroppedFrames.load(std::memory_order_acquire),
         gUnderruns.load(std::memory_order_acquire),
         gTargetActive.load(std::memory_order_acquire),
+        gTargetAvailable.load(std::memory_order_acquire),
+        gDevicePublished.load(std::memory_order_acquire),
+        gRestoreDefaultOutput.load(std::memory_order_acquire) ||
+            gRestoreDefaultSystemOutput.load(std::memory_order_acquire),
         gRelayPriming.load(std::memory_order_acquire),
         gTargetBufferFrames.load(std::memory_order_acquire),
         gTargetIOFrames.load(std::memory_order_acquire),
@@ -835,9 +1005,12 @@ CFStringRef CopyStatusString() {
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "running=%u,target=%s,priming=%s,queuedFrames=%u,queuedMS=%.2f,bufferFrames=%u,targetBufferFrames=%u,targetBufferMS=%.2f,targetIOFrames=%u,targetIOMS=%.2f,dropped=%llu,underruns=%llu,sampleRate=%.0f",
+        "running=%u,target=%s,available=%s,published=%s,restoreDefault=%s,priming=%s,queuedFrames=%u,queuedMS=%.2f,bufferFrames=%u,targetBufferFrames=%u,targetBufferMS=%.2f,targetIOFrames=%u,targetIOMS=%.2f,dropped=%llu,underruns=%llu,sampleRate=%.0f",
         gRunningClients.load(std::memory_order_acquire),
         snapshot.targetAlive ? "yes" : "no",
+        snapshot.targetAvailable ? "yes" : "no",
+        snapshot.devicePublished ? "yes" : "no",
+        snapshot.restoreDefaultOutput ? "yes" : "no",
         snapshot.relayPriming ? "yes" : "no",
         snapshot.queuedFrames,
         queuedMS,
@@ -886,6 +1059,7 @@ Boolean HasBoxProperty(AudioObjectPropertySelector selector) {
     case kAudioObjectPropertyOwner:
     case kAudioObjectPropertyName:
     case kAudioObjectPropertyManufacturer:
+    case kAudioObjectPropertyCustomPropertyInfoList:
     case kAudioBoxPropertyBoxUID:
     case kAudioBoxPropertyTransportType:
     case kAudioBoxPropertyHasAudio:
@@ -895,6 +1069,10 @@ Boolean HasBoxProperty(AudioObjectPropertySelector selector) {
     case kAudioBoxPropertyAcquired:
     case kAudioBoxPropertyAcquisitionFailed:
     case kAudioBoxPropertyDeviceList:
+    case kPropertyTargetUID:
+    case kPropertyBufferFrameSize:
+    case kPropertyStatus:
+    case kPropertyReset:
         return true;
     default:
         return false;
@@ -1061,6 +1239,14 @@ OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
         FlushRingLocked();
     }
     LoadConfigurationFromStorage();
+    AudioObjectPropertyAddress devicesAddress = MakeAddress(kAudioHardwarePropertyDevices);
+    AudioObjectAddPropertyListener(
+        kAudioObjectSystemObject,
+        &devicesAddress,
+        TargetAvailabilityListener,
+        nullptr
+    );
+    TargetAvailabilityListener(kAudioObjectSystemObject, 1, &devicesAddress, nullptr);
     return noErr;
 }
 
@@ -1184,7 +1370,10 @@ OSStatus IsPropertySettable(AudioServerPlugInDriverRef driver,
 
     *isSettable = false;
     if (objectID == kObjectIDBox) {
-        *isSettable = address->mSelector == kAudioBoxPropertyAcquired;
+        *isSettable = address->mSelector == kAudioBoxPropertyAcquired ||
+                      address->mSelector == kPropertyTargetUID ||
+                      address->mSelector == kPropertyBufferFrameSize ||
+                      address->mSelector == kPropertyReset;
     } else if (objectID == kObjectIDDevice) {
         switch (address->mSelector) {
         case kAudioDevicePropertyNominalSampleRate:
@@ -1234,7 +1423,7 @@ OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef driver,
     switch (address->mSelector) {
     case kAudioObjectPropertyOwnedObjects:
         if (objectID == kObjectIDPlugIn) {
-            *outDataSize = 2 * sizeof(AudioObjectID);
+            *outDataSize = (gDevicePublished.load(std::memory_order_acquire) ? 2 : 1) * sizeof(AudioObjectID);
         } else if (objectID == kObjectIDDevice) {
             *outDataSize = 4 * sizeof(AudioObjectID);
         } else {
@@ -1242,8 +1431,12 @@ OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef driver,
         }
         return noErr;
     case kAudioPlugInPropertyDeviceList:
-    case kAudioPlugInPropertyBoxList:
     case kAudioBoxPropertyDeviceList:
+        *outDataSize = gDevicePublished.load(std::memory_order_acquire) ? sizeof(AudioObjectID) : 0;
+        return noErr;
+    case kAudioPlugInPropertyBoxList:
+        *outDataSize = sizeof(AudioObjectID);
+        return noErr;
     case kAudioDevicePropertyRelatedDevices:
     case kAudioDevicePropertyStreams:
     case kAudioObjectPropertyControlList:
@@ -1363,7 +1556,12 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef driver,
     case kAudioObjectPropertyOwnedObjects: {
         if (objectID == kObjectIDPlugIn) {
             const AudioObjectID ids[] = { kObjectIDBox, kObjectIDDevice };
-            *outDataSize = WriteObjectIDs(outData, inDataSize, ids, 2);
+            *outDataSize = WriteObjectIDs(
+                outData,
+                inDataSize,
+                ids,
+                gDevicePublished.load(std::memory_order_acquire) ? 2 : 1
+            );
         } else if (objectID == kObjectIDDevice) {
             const AudioObjectID ids[] = { kObjectIDStreamOutput, kObjectIDVolumeLeft, kObjectIDVolumeRight, kObjectIDMute };
             *outDataSize = WriteObjectIDs(outData, inDataSize, ids, 4);
@@ -1379,7 +1577,12 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef driver,
         return noErr;
     case kAudioPlugInPropertyDeviceList: {
         const AudioObjectID ids[] = { kObjectIDDevice };
-        *outDataSize = WriteObjectIDs(outData, inDataSize, ids, gBoxAcquired ? 1 : 0);
+        *outDataSize = WriteObjectIDs(
+            outData,
+            inDataSize,
+            ids,
+            gDevicePublished.load(std::memory_order_acquire) ? 1 : 0
+        );
         return noErr;
     }
     case kAudioPlugInPropertyTranslateUIDToDevice: {
@@ -1387,7 +1590,9 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef driver,
         AudioObjectID deviceID = kAudioObjectUnknown;
         if (qualifierDataSize == sizeof(CFStringRef) && qualifierData != nullptr) {
             auto uid = *static_cast<CFStringRef const *>(qualifierData);
-            if (uid != nullptr && CFStringCompare(uid, CFSTR("tech.soit.MacDisplayVolume.Device"), 0) == kCFCompareEqualTo) {
+            if (gDevicePublished.load(std::memory_order_acquire) &&
+                uid != nullptr &&
+                CFStringCompare(uid, CFSTR("tech.soit.MacDisplayVolume.Device"), 0) == kCFCompareEqualTo) {
                 deviceID = kObjectIDDevice;
             }
         }
@@ -1421,7 +1626,12 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef driver,
         return noErr;
     case kAudioBoxPropertyDeviceList: {
         const AudioObjectID ids[] = { kObjectIDDevice };
-        *outDataSize = WriteObjectIDs(outData, inDataSize, ids, gBoxAcquired ? 1 : 0);
+        *outDataSize = WriteObjectIDs(
+            outData,
+            inDataSize,
+            ids,
+            gDevicePublished.load(std::memory_order_acquire) ? 1 : 0
+        );
         return noErr;
     }
     case kAudioDevicePropertyTransportType:
@@ -1449,7 +1659,7 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef driver,
         return noErr;
     case kAudioBoxPropertyAcquired:
         if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
-        *static_cast<UInt32 *>(outData) = gBoxAcquired ? 1 : 0;
+        *static_cast<UInt32 *>(outData) = gBoxAcquired.load(std::memory_order_acquire) ? 1 : 0;
         *outDataSize = sizeof(UInt32);
         return noErr;
     case kAudioDevicePropertyDeviceUID:
@@ -1491,6 +1701,10 @@ OSStatus GetPropertyData(AudioServerPlugInDriverRef driver,
         *outDataSize = sizeof(UInt32);
         return noErr;
     case kAudioDevicePropertyDeviceIsAlive:
+        if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
+        *static_cast<UInt32 *>(outData) = gTargetAvailable.load(std::memory_order_acquire) ? 1 : 0;
+        *outDataSize = sizeof(UInt32);
+        return noErr;
     case kAudioDevicePropertyDeviceCanBeDefaultDevice:
     case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
         if (inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
@@ -1723,8 +1937,99 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef driver,
         LogUnknownProperty("SetPropertyData", objectID, address);
         return kAudioHardwareUnknownPropertyError;
     }
-    if (inData == nullptr && !(objectID == kObjectIDDevice && address->mSelector == kPropertyReset)) {
+    if (inData == nullptr &&
+        !((objectID == kObjectIDDevice || objectID == kObjectIDBox) &&
+          address->mSelector == kPropertyReset)) {
         return kAudioHardwareBadPropertySizeError;
+    }
+
+    if (objectID == kObjectIDDevice || objectID == kObjectIDBox) {
+        switch (address->mSelector) {
+        case kPropertyBufferFrameSize: {
+            if (inDataSize != sizeof(CFPropertyListRef)) { return kAudioHardwareBadPropertySizeError; }
+            CFPropertyListRef propertyList = *static_cast<CFPropertyListRef const *>(inData);
+            if (propertyList == nullptr || CFGetTypeID(propertyList) != CFNumberGetTypeID()) {
+                return kAudioHardwareBadPropertySizeError;
+            }
+            SInt32 rawValue = 0;
+            if (!CFNumberGetValue(static_cast<CFNumberRef>(propertyList), kCFNumberSInt32Type, &rawValue)) {
+                return kAudioHardwareBadPropertySizeError;
+            }
+            bool didChangeBufferFrames = false;
+            UInt32 value = std::clamp<UInt32>(static_cast<UInt32>(std::max<SInt32>(rawValue, 0)), 64, 256);
+            {
+                std::lock_guard<std::mutex> lock(gStateMutex);
+                if (gPreferredBufferFrames.load(std::memory_order_acquire) != value) {
+                    gPreferredBufferFrames.store(value, std::memory_order_release);
+                    FlushRingLocked();
+                    didChangeBufferFrames = true;
+                }
+            }
+            if (didChangeBufferFrames) {
+                SavePreferredBuffer(value);
+                Notify(kObjectIDBox, kPropertyBufferFrameSize);
+                if (gDevicePublished.load(std::memory_order_acquire)) {
+                    Notify(kObjectIDDevice, kAudioDevicePropertyBufferFrameSize);
+                    Notify(kObjectIDDevice, kPropertyBufferFrameSize);
+                }
+            }
+            return noErr;
+        }
+        case kPropertyTargetUID: {
+            if (inDataSize != sizeof(CFStringRef)) { return kAudioHardwareBadPropertySizeError; }
+            CFStringRef uidToSave = nullptr;
+            CFStringRef newUID = *static_cast<CFStringRef const *>(inData);
+            if (IsVirtualDeviceUID(newUID)) {
+                return kAudioHardwareIllegalOperationError;
+            }
+            {
+                std::lock_guard<std::mutex> lock(gStateMutex);
+                if (StringValuesEqual(gTargetUID, newUID)) {
+                    return noErr;
+                }
+                if (gTargetUID != nullptr) {
+                    CFRelease(gTargetUID);
+                }
+                gTargetUID = newUID != nullptr ? CFStringCreateCopy(nullptr, newUID) : nullptr;
+                uidToSave = gTargetUID != nullptr ? CFStringCreateCopy(nullptr, gTargetUID) : nullptr;
+                FlushRingLocked();
+            }
+            SaveTargetUID(uidToSave);
+            if (uidToSave != nullptr) {
+                CFRelease(uidToSave);
+            }
+            dispatch_async(gTargetQueue, ^{
+                SetTargetAvailability(false);
+                EvaluateTargetAvailability();
+            });
+            Notify(kObjectIDBox, kPropertyTargetUID);
+            Notify(kObjectIDBox, kPropertyStatus);
+            if (gDevicePublished.load(std::memory_order_acquire)) {
+                Notify(kObjectIDDevice, kPropertyTargetUID);
+                Notify(kObjectIDDevice, kPropertyStatus);
+            }
+            return noErr;
+        }
+        case kPropertyReset:
+            if (inDataSize != 0) {
+                if (inDataSize != sizeof(CFPropertyListRef)) { return kAudioHardwareBadPropertySizeError; }
+                CFPropertyListRef propertyList = *static_cast<CFPropertyListRef const *>(inData);
+                if (propertyList == nullptr || CFGetTypeID(propertyList) != CFNumberGetTypeID()) {
+                    return kAudioHardwareBadPropertySizeError;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(gStateMutex);
+                FlushRingLocked(true);
+            }
+            Notify(kObjectIDBox, kPropertyStatus);
+            if (gDevicePublished.load(std::memory_order_acquire)) {
+                Notify(kObjectIDDevice, kPropertyStatus);
+            }
+            return noErr;
+        default:
+            break;
+        }
     }
 
     if (objectID == kObjectIDDevice) {
@@ -1764,77 +2069,6 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef driver,
             }
             return noErr;
         }
-        case kPropertyBufferFrameSize: {
-            if (inDataSize != sizeof(CFPropertyListRef)) { return kAudioHardwareBadPropertySizeError; }
-            CFPropertyListRef propertyList = *static_cast<CFPropertyListRef const *>(inData);
-            if (propertyList == nullptr || CFGetTypeID(propertyList) != CFNumberGetTypeID()) {
-                return kAudioHardwareBadPropertySizeError;
-            }
-            SInt32 rawValue = 0;
-            if (!CFNumberGetValue(static_cast<CFNumberRef>(propertyList), kCFNumberSInt32Type, &rawValue)) {
-                return kAudioHardwareBadPropertySizeError;
-            }
-            bool didChangeBufferFrames = false;
-            UInt32 value = std::clamp<UInt32>(static_cast<UInt32>(std::max<SInt32>(rawValue, 0)), 64, 256);
-            {
-                std::lock_guard<std::mutex> lock(gStateMutex);
-                if (gPreferredBufferFrames.load(std::memory_order_acquire) != value) {
-                    gPreferredBufferFrames.store(value, std::memory_order_release);
-                    FlushRingLocked();
-                    didChangeBufferFrames = true;
-                }
-            }
-            if (didChangeBufferFrames) {
-                SavePreferredBuffer(value);
-                Notify(kObjectIDDevice, kAudioDevicePropertyBufferFrameSize);
-                Notify(kObjectIDDevice, kPropertyBufferFrameSize);
-            }
-            return noErr;
-        }
-        case kPropertyTargetUID: {
-            if (inDataSize != sizeof(CFStringRef)) { return kAudioHardwareBadPropertySizeError; }
-            bool shouldStartTarget = false;
-            CFStringRef uidToSave = nullptr;
-            CFStringRef newUID = *static_cast<CFStringRef const *>(inData);
-            if (IsVirtualDeviceUID(newUID)) {
-                return kAudioHardwareIllegalOperationError;
-            }
-            {
-                std::lock_guard<std::mutex> lock(gStateMutex);
-                if (StringValuesEqual(gTargetUID, newUID)) {
-                    return noErr;
-                }
-                if (gTargetUID != nullptr) {
-                    CFRelease(gTargetUID);
-                }
-                gTargetUID = newUID != nullptr ? CFStringCreateCopy(nullptr, newUID) : nullptr;
-                uidToSave = gTargetUID != nullptr ? CFStringCreateCopy(nullptr, gTargetUID) : nullptr;
-                FlushRingLocked();
-                shouldStartTarget = gRunningClients.load(std::memory_order_acquire) > 0;
-            }
-            SaveTargetUID(uidToSave);
-            if (uidToSave != nullptr) {
-                CFRelease(uidToSave);
-            }
-            ScheduleRestartTargetDevice(shouldStartTarget);
-            Notify(kObjectIDDevice, kPropertyTargetUID);
-            Notify(kObjectIDDevice, kPropertyStatus);
-            return noErr;
-        }
-        case kPropertyReset:
-            if (inDataSize != 0) {
-                if (inDataSize != sizeof(CFPropertyListRef)) { return kAudioHardwareBadPropertySizeError; }
-                CFPropertyListRef propertyList = *static_cast<CFPropertyListRef const *>(inData);
-                if (propertyList == nullptr || CFGetTypeID(propertyList) != CFNumberGetTypeID()) {
-                    return kAudioHardwareBadPropertySizeError;
-                }
-            }
-            {
-                std::lock_guard<std::mutex> lock(gStateMutex);
-                FlushRingLocked(true);
-            }
-            Notify(kObjectIDDevice, kPropertyStatus);
-            return noErr;
         default:
             return kAudioHardwareUnknownPropertyError;
         }
@@ -1880,32 +2114,14 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef driver,
     if (objectID == kObjectIDBox && address->mSelector == kAudioBoxPropertyAcquired) {
         if (inDataSize != sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
         bool acquired = *static_cast<const UInt32 *>(inData) != 0;
-        bool shouldStopTarget = false;
-        bool shouldRestartTarget = false;
-        {
-            std::lock_guard<std::mutex> lock(gStateMutex);
-            if (gBoxAcquired == acquired) {
-                return noErr;
-            }
-            gBoxAcquired = acquired;
-            if (!acquired) {
-                FlushRingLocked();
-                shouldStopTarget = true;
-            } else if (gRunningClients.load(std::memory_order_acquire) > 0) {
-                FlushRingLocked();
-                shouldRestartTarget = true;
-            }
+        if (gBoxAcquired.exchange(acquired, std::memory_order_acq_rel) == acquired) {
+            return noErr;
         }
-        if (shouldRestartTarget) {
-            ScheduleRestartTargetDevice(true);
-        } else if (shouldStopTarget) {
-            ScheduleStopTargetDevice();
-        }
+        dispatch_async(gTargetQueue, ^{
+            UpdateDevicePublication(false);
+        });
         Notify(kObjectIDBox, kAudioBoxPropertyAcquired);
-        Notify(kObjectIDBox, kAudioBoxPropertyDeviceList);
-        Notify(kObjectIDPlugIn, kAudioPlugInPropertyDeviceList);
-        Notify(kObjectIDPlugIn, kAudioObjectPropertyOwnedObjects);
-        Notify(kObjectIDDevice, kPropertyStatus);
+        Notify(kObjectIDBox, kPropertyStatus);
         return noErr;
     }
 
@@ -1946,6 +2162,9 @@ OSStatus StartIO(AudioServerPlugInDriverRef driver, AudioObjectID deviceID, UInt
         return kAudioHardwareBadObjectError;
     }
     if (deviceID != kObjectIDDevice) {
+        return kAudioHardwareBadDeviceError;
+    }
+    if (!gDevicePublished.load(std::memory_order_acquire)) {
         return kAudioHardwareBadDeviceError;
     }
 

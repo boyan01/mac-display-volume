@@ -33,6 +33,7 @@ public enum AudioHardwareError: Error, LocalizedError {
 public struct AudioHardware: Sendable {
     public static let virtualDeviceName = "Mac Display Volume"
     public static let virtualDeviceUID = "tech.soit.MacDisplayVolume.Device"
+    public static let driverBoxUID = "tech.soit.MacDisplayVolume.Box"
     public static let supportedTargetSampleRate = 48_000.0
     public static let targetUIDSelector = fourCC("tgud")
     public static let bufferFrameSizeSelector = fourCC("bfsz")
@@ -74,6 +75,10 @@ public struct AudioHardware: Sendable {
         try outputDevices().first { $0.uid == Self.virtualDeviceUID }
     }
 
+    public func isDriverInstalled() -> Bool {
+        (try? driverControlObjectID()) != nil
+    }
+
     public func setDefaultOutputDevice(uid: String) throws {
         let deviceID = try deviceID(forUID: uid)
         try setSystemDeviceProperty(kAudioHardwarePropertyDefaultOutputDevice, deviceID)
@@ -85,24 +90,30 @@ public struct AudioHardware: Sendable {
     }
 
     public func applyDriverConfiguration(_ configuration: DisplayVolumeConfiguration) throws {
-        let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
+        let controlObjectID = try driverControlObjectID()
         try validateTargetDevice(uid: configuration.targetOutputDeviceUID)
-        try setStringProperty(
-            virtualDeviceID,
-            Self.targetUIDSelector,
-            configuration.targetOutputDeviceUID
+        try setDriverTargetOutputUID(configuration.targetOutputDeviceUID, controlObjectID: controlObjectID)
+        try setPreferredBufferFrameSize(
+            UInt32(configuration.preferredBufferFrameSize),
+            controlObjectID: controlObjectID
         )
-        try setPreferredBufferFrameSize(UInt32(configuration.preferredBufferFrameSize), virtualDeviceID: virtualDeviceID)
     }
 
     public func setPreferredBufferFrameSize(_ value: UInt32) throws {
-        let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
-        try setPreferredBufferFrameSize(value, virtualDeviceID: virtualDeviceID)
+        try setPreferredBufferFrameSize(value, controlObjectID: driverControlObjectID())
     }
 
-    private func setPreferredBufferFrameSize(_ value: UInt32, virtualDeviceID: AudioDeviceID) throws {
+    public func setDriverTargetOutputUID(_ uid: String) throws {
+        try setDriverTargetOutputUID(uid, controlObjectID: driverControlObjectID())
+    }
+
+    private func setDriverTargetOutputUID(_ uid: String, controlObjectID: AudioObjectID) throws {
+        try setStringProperty(controlObjectID, Self.targetUIDSelector, uid)
+    }
+
+    private func setPreferredBufferFrameSize(_ value: UInt32, controlObjectID: AudioObjectID) throws {
         try setNumberProperty(
-            virtualDeviceID,
+            controlObjectID,
             Self.bufferFrameSizeSelector,
             value
         )
@@ -125,23 +136,19 @@ public struct AudioHardware: Sendable {
     }
 
     public func driverTargetOutputUID() throws -> String {
-        let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
-        return try stringProperty(virtualDeviceID, Self.targetUIDSelector)
+        try stringProperty(driverControlObjectID(), Self.targetUIDSelector)
     }
 
     public func driverPreferredBufferFrameSize() throws -> Int {
-        let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
-        return Int(try numberProperty(virtualDeviceID, Self.bufferFrameSizeSelector))
+        Int(try numberProperty(driverControlObjectID(), Self.bufferFrameSizeSelector))
     }
 
     public func driverStatus() throws -> DriverStatus {
-        let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
-        return DriverStatus.parse(try stringProperty(virtualDeviceID, Self.statusSelector))
+        DriverStatus.parse(try stringProperty(driverControlObjectID(), Self.statusSelector))
     }
 
     public func resetRelay() throws {
-        let virtualDeviceID = try deviceID(forUID: Self.virtualDeviceUID)
-        try setNumberProperty(virtualDeviceID, Self.resetSelector, 1)
+        try setNumberProperty(driverControlObjectID(), Self.resetSelector, 1)
     }
 
     public func restartCoreAudio() async throws {
@@ -217,6 +224,60 @@ public struct AudioHardware: Sendable {
         }
 
         return devices
+    }
+
+    private func driverControlObjectID() throws -> AudioObjectID {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyBoxList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &dataSize
+        )
+        guard status == noErr else {
+            throw AudioHardwareError.propertySize(
+                AudioObjectID(kAudioObjectSystemObject),
+                kAudioHardwarePropertyBoxList,
+                status
+            )
+        }
+
+        var boxes = Array(
+            repeating: AudioObjectID(0),
+            count: Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        )
+        status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &dataSize,
+            &boxes
+        )
+        guard status == noErr else {
+            throw AudioHardwareError.propertyRead(
+                AudioObjectID(kAudioObjectSystemObject),
+                kAudioHardwarePropertyBoxList,
+                status
+            )
+        }
+
+        if let boxID = boxes.first(where: {
+            (try? stringProperty($0, kAudioBoxPropertyBoxUID)) == Self.driverBoxUID
+        }) {
+            return boxID
+        }
+
+        if let virtualDeviceID = try? deviceID(forUID: Self.virtualDeviceUID) {
+            return virtualDeviceID
+        }
+        throw AudioHardwareError.deviceNotFound(Self.virtualDeviceName)
     }
 
     private func deviceID(forUID uid: String) throws -> AudioDeviceID {

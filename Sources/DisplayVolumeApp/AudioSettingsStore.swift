@@ -8,11 +8,13 @@ final class AudioSettingsStore {
     var devices: [AudioDeviceInfo] = []
     var defaultOutputDevice: AudioDeviceInfo?
     var virtualDevice: AudioDeviceInfo?
+    var isDriverInstalled = false
     var driverStatus = DriverStatus()
     var configuration = DisplayVolumeConfiguration()
     var errorMessage: String?
 
     private let hardware = AudioHardware()
+    private let defaults = UserDefaults.standard
     private var statusRefreshTask: Task<Void, Never>?
 
     init() {
@@ -24,15 +26,23 @@ final class AudioSettingsStore {
         devices.first { $0.uid == configuration.targetOutputDeviceUID }
     }
 
+    var selectedTargetName: String? {
+        selectedTargetDevice?.name ?? defaults.string(forKey: "targetOutputDeviceName")
+    }
+
     func refresh() {
         do {
             devices = try hardware.outputDevices()
             defaultOutputDevice = try hardware.defaultOutputDevice()
             virtualDevice = try hardware.virtualDevice()
-            if virtualDevice != nil {
+            isDriverInstalled = hardware.isDriverInstalled()
+            if isDriverInstalled {
                 driverStatus = try hardware.driverStatus()
                 configuration.targetOutputDeviceUID = try hardware.driverTargetOutputUID()
                 configuration.preferredBufferFrameSize = try hardware.driverPreferredBufferFrameSize()
+                if let selectedTargetDevice {
+                    defaults.set(selectedTargetDevice.name, forKey: "targetOutputDeviceName")
+                }
             }
             errorMessage = nil
         } catch {
@@ -51,20 +61,18 @@ final class AudioSettingsStore {
                 guard let self else {
                     return
                 }
-                self.refreshDriverStatus()
+                self.refresh()
             }
         }
     }
 
-    private func refreshDriverStatus() {
-        guard virtualDevice != nil, let status = try? hardware.driverStatus() else {
-            return
-        }
-        driverStatus = status
-    }
-
     func selectTargetDevice(_ uid: String) {
         configuration.targetOutputDeviceUID = uid
+        if let device = devices.first(where: { $0.uid == uid }) {
+            defaults.set(device.name, forKey: "targetOutputDeviceName")
+        } else if uid.isEmpty {
+            defaults.removeObject(forKey: "targetOutputDeviceName")
+        }
         applyDriverConfiguration()
     }
 

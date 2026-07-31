@@ -49,14 +49,14 @@ struct ContentView: View {
                     } label: {
                         Label("Apply Driver Config", systemImage: "checkmark.circle")
                     }
-                    .disabled(store.virtualDevice == nil)
+                    .disabled(!store.isDriverInstalled)
 
                     Button {
                         store.resetRelay()
                     } label: {
                         Label("Reset Relay", systemImage: "waveform.path")
                     }
-                    .disabled(store.virtualDevice == nil)
+                    .disabled(!store.isDriverInstalled)
 
                     Divider()
 
@@ -129,6 +129,16 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Picker("Target display audio", selection: selection) {
                     Text("Choose a device").tag("")
+                    if !store.configuration.targetOutputDeviceUID.isEmpty,
+                       store.selectedTargetDevice == nil {
+                        Text(
+                            String(
+                                format: String(localized: "%@ (Disconnected)"),
+                                store.selectedTargetName ?? store.configuration.targetOutputDeviceUID
+                            )
+                        )
+                            .tag(store.configuration.targetOutputDeviceUID)
+                    }
                     ForEach(store.devices) { device in
                         if device.uid != AudioHardware.virtualDeviceUID,
                            AudioHardware.isSupportedTargetSampleRate(device.nominalSampleRate) {
@@ -304,8 +314,11 @@ struct ContentView: View {
         if isDriverWorking {
             return String(localized: "Driver is working. You can quit the app anytime.")
         }
-        if store.virtualDevice == nil {
+        if !store.isDriverInstalled {
             return String(localized: "Driver is not installed.")
+        }
+        if !store.configuration.targetOutputDeviceUID.isEmpty && !store.driverStatus.targetAvailable {
+            return String(localized: "The target output is disconnected. The virtual device will return automatically.")
         }
         if store.driverStatus.isPriming {
             return String(localized: "Driver is priming the relay buffer.")
@@ -318,8 +331,11 @@ struct ContentView: View {
     }
 
     private var driverStatusText: String {
-        if store.virtualDevice == nil {
+        if !store.isDriverInstalled {
             return String(localized: "Missing")
+        }
+        if !store.driverStatus.targetAvailable {
+            return String(localized: "Disconnected")
         }
         if !store.driverStatus.isRunning {
             return String(localized: "Idle")
@@ -331,8 +347,11 @@ struct ContentView: View {
     }
 
     private var statusSymbol: String {
-        if store.virtualDevice == nil {
+        if !store.isDriverInstalled {
             return "exclamationmark.triangle.fill"
+        }
+        if !store.driverStatus.targetAvailable {
+            return "display.trianglebadge.exclamationmark"
         }
         if !store.driverStatus.isRunning {
             return "pause.circle.fill"
@@ -344,8 +363,11 @@ struct ContentView: View {
     }
 
     private var statusColor: Color {
-        if store.virtualDevice == nil {
+        if !store.isDriverInstalled {
             return .red
+        }
+        if !store.driverStatus.targetAvailable {
+            return .orange
         }
         if !store.driverStatus.isRunning {
             return .secondary
@@ -394,7 +416,7 @@ struct ContentView: View {
     }
 
     private var selectedTargetName: String {
-        store.selectedTargetDevice?.name ?? String(localized: "Not selected")
+        store.selectedTargetName ?? String(localized: "Not selected")
     }
 
     private var systemOutputName: String {
@@ -402,10 +424,18 @@ struct ContentView: View {
     }
 
     private var virtualDeviceName: String {
-        store.virtualDevice?.name ?? String(localized: "Not installed")
+        if let virtualDevice = store.virtualDevice {
+            return virtualDevice.name
+        }
+        return store.isDriverInstalled
+            ? String(localized: "Temporarily unavailable")
+            : String(localized: "Not installed")
     }
 
     private var targetStateText: String {
+        if !store.driverStatus.targetAvailable {
+            return String(localized: "Disconnected")
+        }
         if !store.driverStatus.isRunning {
             return String(localized: "Idle")
         }

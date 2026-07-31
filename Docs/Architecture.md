@@ -31,6 +31,36 @@ MacDisplayVolumeAudio.driver
   custom properties for target, buffer, status, and reset
 ```
 
+The driver publishes an always-available AudioBox for configuration and
+diagnostics. The virtual AudioDevice is published only while its configured
+target is available.
+
+## Fixed Target And Device Publication
+
+The selected target UID is persistent. The driver never falls back to a
+different output device.
+
+The driver listens for changes to the CoreAudio device list and to the selected
+target's alive, sample-rate, and output-stream properties. A target is available
+when its UID resolves to a live output device with at least one output channel
+and a 48 kHz nominal sample rate.
+
+```text
+target unavailable
+  -> remember whether Mac Display Volume was the default output
+  -> stop the target IOProc and flush the relay
+  -> remove Mac Display Volume from the plug-in and box device lists
+
+target available
+  -> publish Mac Display Volume
+  -> restore it as the default output when it was displaced by the disconnect
+```
+
+Default-output restoration intent is stored through the AudioServerPlugIn host,
+so it survives a `coreaudiod` restart while the target remains disconnected.
+The driver retries restoration after publication to allow CoreAudio to finish
+registering the virtual device.
+
 ## Runtime Flow
 
 Audio apps render into `Mac Display Volume`, the virtual HAL output device. The
@@ -68,7 +98,8 @@ deadline.
 
 ## Driver Custom Properties
 
-The app talks to the driver through device-scoped custom properties:
+The app talks to the driver through custom properties on the always-present
+AudioBox. The virtual device exposes the same properties for compatibility:
 
 - `tgud`: target output device UID as `CFString`.
 - `bfsz`: preferred buffer frame size as a `CFPropertyList` number.
@@ -78,7 +109,7 @@ The app talks to the driver through device-scoped custom properties:
 The driver status string currently includes:
 
 ```text
-running=1,target=yes,priming=no,queuedFrames=512,queuedMS=10.67,bufferFrames=128,targetBufferFrames=512,targetBufferMS=10.67,targetIOFrames=512,targetIOMS=10.67,dropped=0,underruns=0,sampleRate=48000
+running=1,target=yes,available=yes,published=yes,restoreDefault=no,priming=no,queuedFrames=512,queuedMS=10.67,bufferFrames=128,targetBufferFrames=512,targetBufferMS=10.67,targetIOFrames=512,targetIOMS=10.67,dropped=0,underruns=0,sampleRate=48000
 ```
 
 `DisplayVolume.app` polls this status so the UI can show whether the driver is
@@ -88,6 +119,11 @@ idle, priming, or running.
 the selected real output device's reported buffer frame size when the target
 starts, and `targetIOFrames` is the most recent frame count requested by the
 target device IOProc.
+
+`available` reports whether the fixed target currently satisfies the relay
+requirements. `published` reports whether the virtual device is currently
+exposed to the system. `restoreDefault` reports pending default-output
+restoration after a disconnect.
 
 ## Relay State Model
 

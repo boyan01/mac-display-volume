@@ -38,7 +38,10 @@ used from another machine.
 - Creates a macOS virtual audio output device.
 - Supports system volume and mute controls.
 - Forwards audio to the real display audio device with low latency.
-- Provides a menu bar app for choosing the target output device.
+- Remembers one fixed target output device and never relays to a fallback.
+- Temporarily removes the virtual device when the fixed target is unavailable.
+- Restores the virtual device and its previous default-output role on reconnect.
+- Provides an app for choosing the fixed target output device.
 - Can switch the default output to the virtual device.
 - Keeps the display's hardware volume unchanged.
 
@@ -82,6 +85,9 @@ Settings to control the volume of `Mac Display Volume`.
 
 - The target output device must support `48 kHz`.
 - Do not set `Mac Display Volume` itself as the target device.
+- Disconnecting the fixed target temporarily removes `Mac Display Volume` from
+  the system output list. It returns automatically when the same target UID is
+  available again.
 - If audio latency starts accumulating, use **Reset Relay** first.
 - If CoreAudio gets into a bad state, use **Restart coreaudiod** or reboot the
   Mac.
@@ -91,12 +97,14 @@ Settings to control the volume of `Mac Display Volume`.
 Run the HAL driver smoke test inside a disposable macOS VM:
 
 ```sh
-Scripts/vm-smoke-test.sh
+Scripts/vm-smoke-test.sh --require-target --test-target-availability
 ```
 
 The script builds and installs the driver, restarts `coreaudiod`, verifies
 `system_profiler` enumeration and `coreaudiod` bundle loading, runs
-`DriverProbe`, and uninstalls the driver by default.
+`DriverProbe`, and uninstalls the driver by default. The target-availability
+check withdraws and republishes the virtual device, then verifies that a
+displaced default output is restored.
 
 ## Uninstall
 
@@ -110,7 +118,7 @@ The uninstall script removes the app and HAL driver, then restarts CoreAudio.
 
 Mac Display Volume has two parts:
 
-- SwiftUI menu bar app: selects the target device, applies configuration, and
+- SwiftUI app: selects the fixed target device, applies configuration, and
   switches the default output.
 - CoreAudio HAL driver: exposes the virtual output device, applies software
   volume, and forwards audio.
