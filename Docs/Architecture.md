@@ -109,11 +109,13 @@ AudioBox. The virtual device exposes the same properties for compatibility:
 The driver status string currently includes:
 
 ```text
-running=1,target=yes,available=yes,published=yes,restoreDefault=no,priming=no,queuedFrames=512,queuedMS=10.67,bufferFrames=128,targetBufferFrames=512,targetBufferMS=10.67,targetIOFrames=512,targetIOMS=10.67,dropped=0,underruns=0,sampleRate=48000
+running=1,target=yes,available=yes,published=yes,restoreDefault=no,priming=no,queuedFrames=512,queuedMS=10.67,bufferFrames=128,targetBufferFrames=512,targetBufferMS=10.67,targetIOFrames=512,targetIOMS=10.67,dropped=0,underruns=0,sampleRate=48000,targetStartError=0
 ```
 
 `DisplayVolume.app` polls this status so the UI can show whether the driver is
-idle, priming, or running.
+idle, priming, running, or reporting a target start failure (`targetStartError`
+contains the CoreAudio `OSStatus` from `AudioDeviceCreateIOProcID` /
+`AudioDeviceStart`).
 
 `queuedMS` is the relay's current extra queued latency. `targetBufferFrames` is
 the selected real output device's reported buffer frame size when the target

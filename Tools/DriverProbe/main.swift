@@ -502,7 +502,7 @@ private func runProbe(options: Options) throws {
         print("virtualDevice=\(virtualDevice.id) name=\"\(virtualDevice.name)\" uid=\"\(virtualDevice.uid)\"")
         print("outputs=\(outputs.count) supportedTargets=\(supportedTargets.count)")
         print("stream=\(outputStream)")
-        print("status running=\(status.isRunning) target=\(status.targetAlive) available=\(status.targetAvailable) published=\(status.devicePublished) restoreDefault=\(status.willRestoreDefaultOutput) priming=\(status.isPriming) queued=\(status.queuedFrames) queuedMS=\(String(format: "%.2f", status.queuedMilliseconds)) buffer=\(status.bufferFrames) targetBuffer=\(status.targetBufferFrames) targetBufferMS=\(String(format: "%.2f", status.targetBufferMilliseconds)) targetIO=\(status.targetIOFrames) targetIOMS=\(String(format: "%.2f", status.targetIOMilliseconds)) dropped=\(status.droppedFrames) underruns=\(status.underruns)")
+        print("status running=\(status.isRunning) target=\(status.targetAlive) available=\(status.targetAvailable) published=\(status.devicePublished) restoreDefault=\(status.willRestoreDefaultOutput) priming=\(status.isPriming) queued=\(status.queuedFrames) queuedMS=\(String(format: "%.2f", status.queuedMilliseconds)) buffer=\(status.bufferFrames) targetBuffer=\(status.targetBufferFrames) targetBufferMS=\(String(format: "%.2f", status.targetBufferMilliseconds)) targetIO=\(status.targetIOFrames) targetIOMS=\(String(format: "%.2f", status.targetIOMilliseconds)) dropped=\(status.droppedFrames) underruns=\(status.underruns) targetStartError=\(status.targetStartError)")
     }
 }
 

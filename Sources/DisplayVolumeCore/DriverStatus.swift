@@ -17,6 +17,30 @@ public struct DriverStatus: Equatable, Sendable {
     public var droppedFrames: Int
     public var underruns: Int
     public var sampleRate: Double
+    public var targetStartError: Int32
+
+    public var hasTargetStartError: Bool {
+        targetStartError != 0
+    }
+
+    public var targetStartErrorCodeDescription: String? {
+        guard targetStartError != 0 else {
+            return nil
+        }
+
+        let unsigned = UInt32(bitPattern: targetStartError)
+        let bytes = [
+            UInt8((unsigned >> 24) & 0xff),
+            UInt8((unsigned >> 16) & 0xff),
+            UInt8((unsigned >> 8) & 0xff),
+            UInt8(unsigned & 0xff),
+        ]
+        if bytes.allSatisfy({ $0 >= 0x20 && $0 <= 0x7e }),
+           let fourCC = String(bytes: bytes, encoding: .ascii) {
+            return "'\(fourCC)' (\(targetStartError))"
+        }
+        return "\(targetStartError)"
+    }
 
     public init(
         isRunning: Bool = false,
@@ -34,7 +58,8 @@ public struct DriverStatus: Equatable, Sendable {
         targetIOMilliseconds: Double = 0,
         droppedFrames: Int = 0,
         underruns: Int = 0,
-        sampleRate: Double = 0
+        sampleRate: Double = 0,
+        targetStartError: Int32 = 0
     ) {
         self.isRunning = isRunning
         self.targetAlive = targetAlive
@@ -52,6 +77,7 @@ public struct DriverStatus: Equatable, Sendable {
         self.droppedFrames = droppedFrames
         self.underruns = underruns
         self.sampleRate = sampleRate
+        self.targetStartError = targetStartError
     }
 
     public static func parse(_ rawValue: String) -> DriverStatus {
@@ -78,7 +104,8 @@ public struct DriverStatus: Equatable, Sendable {
             targetIOMilliseconds: Double(values["targetIOMS"] ?? "0") ?? 0,
             droppedFrames: Int(values["dropped"] ?? "0") ?? 0,
             underruns: Int(values["underruns"] ?? "0") ?? 0,
-            sampleRate: Double(values["sampleRate"] ?? "0") ?? 0
+            sampleRate: Double(values["sampleRate"] ?? "0") ?? 0,
+            targetStartError: Int32(values["targetStartError"] ?? "0") ?? 0
         )
     }
 }

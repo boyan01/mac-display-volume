@@ -43,9 +43,12 @@
 "Status" = "状态";
 "System output" = "系统输出";
 "Target" = "目标";
+"Target Error" = "目标异常";
 "Target buffer" = "目标缓冲";
 "Target display audio" = "目标显示器音频";
 "Target IO" = "目标 IO";
+"Target output failed to start (%@). Reconnect the display or restart coreaudiod." = "目标输出启动失败（%@），请重新插拔显示器或重启 coreaudiod。";
+"Start failed (%@)" = "启动失败（%@）";
 "Temporarily unavailable" = "暂时不可用";
 "Target alive: %@" = "目标在线：%@";
 "Target: %@" = "目标：%@";

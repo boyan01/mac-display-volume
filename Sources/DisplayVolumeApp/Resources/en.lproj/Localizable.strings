@@ -43,9 +43,12 @@
 "Status" = "Status";
 "System output" = "System output";
 "Target" = "Target";
+"Target Error" = "Target Error";
 "Target buffer" = "Target buffer";
 "Target display audio" = "Target display audio";
 "Target IO" = "Target IO";
+"Target output failed to start (%@). Reconnect the display or restart coreaudiod." = "Target output failed to start (%@). Reconnect the display or restart coreaudiod.";
+"Start failed (%@)" = "Start failed (%@)";
 "Temporarily unavailable" = "Temporarily unavailable";
 "Target alive: %@" = "Target alive: %@";
 "Target: %@" = "Target: %@";

@@ -201,7 +201,12 @@ struct ContentView: View {
         sectionPanel("Driver", systemImage: "waveform.path.ecg") {
             VStack(alignment: .leading, spacing: 12) {
                 infoRow("Virtual device", value: virtualDeviceName, systemImage: "externaldrive.connected.to.line.below")
-                infoRow("Target", value: targetStateText, systemImage: "antenna.radiowaves.left.and.right")
+                infoRow(
+                    "Target",
+                    value: targetStateText,
+                    systemImage: "antenna.radiowaves.left.and.right",
+                    valueColor: hasTargetStartError ? .red : .primary
+                )
 
                 if let errorMessage = store.errorMessage {
                     Divider()
@@ -303,11 +308,18 @@ struct ContentView: View {
         }
     }
 
+    private var hasTargetStartError: Bool {
+        store.isDriverInstalled &&
+            store.driverStatus.targetAvailable &&
+            store.driverStatus.hasTargetStartError
+    }
+
     private var isDriverWorking: Bool {
         store.virtualDevice != nil &&
             store.driverStatus.isRunning &&
             !store.driverStatus.isPriming &&
-            store.driverStatus.targetAlive
+            store.driverStatus.targetAlive &&
+            !store.driverStatus.hasTargetStartError
     }
 
     private var headerMessage: String {
@@ -320,14 +332,26 @@ struct ContentView: View {
         if !store.configuration.targetOutputDeviceUID.isEmpty && !store.driverStatus.targetAvailable {
             return String(localized: "The target output is disconnected. The virtual device will return automatically.")
         }
-        if store.driverStatus.isPriming {
+        if hasTargetStartError, let code = store.driverStatus.targetStartErrorCodeDescription {
+            return String(
+                format: String(localized: "Target output failed to start (%@). Reconnect the display or restart coreaudiod."),
+                code
+            )
+        }
+        if store.driverStatus.isRunning && store.driverStatus.isPriming {
             return String(localized: "Driver is priming the relay buffer.")
         }
         return String(localized: "Choose a target output and switch to the virtual device.")
     }
 
     private var headerMessageColor: Color {
-        isDriverWorking ? .green : .secondary
+        if isDriverWorking {
+            return .green
+        }
+        if hasTargetStartError {
+            return .red
+        }
+        return .secondary
     }
 
     private var driverStatusText: String {
@@ -336,6 +360,9 @@ struct ContentView: View {
         }
         if !store.driverStatus.targetAvailable {
             return String(localized: "Disconnected")
+        }
+        if hasTargetStartError {
+            return String(localized: "Target Error")
         }
         if !store.driverStatus.isRunning {
             return String(localized: "Idle")
@@ -353,6 +380,9 @@ struct ContentView: View {
         if !store.driverStatus.targetAvailable {
             return "display.trianglebadge.exclamationmark"
         }
+        if hasTargetStartError {
+            return "exclamationmark.triangle.fill"
+        }
         if !store.driverStatus.isRunning {
             return "pause.circle.fill"
         }
@@ -368,6 +398,9 @@ struct ContentView: View {
         }
         if !store.driverStatus.targetAvailable {
             return .orange
+        }
+        if hasTargetStartError {
+            return .red
         }
         if !store.driverStatus.isRunning {
             return .secondary
@@ -435,6 +468,9 @@ struct ContentView: View {
     private var targetStateText: String {
         if !store.driverStatus.targetAvailable {
             return String(localized: "Disconnected")
+        }
+        if hasTargetStartError, let code = store.driverStatus.targetStartErrorCodeDescription {
+            return String(format: String(localized: "Start failed (%@)"), code)
         }
         if !store.driverStatus.isRunning {
             return String(localized: "Idle")

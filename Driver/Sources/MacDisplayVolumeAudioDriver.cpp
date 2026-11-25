@@ -41,6 +41,7 @@ constexpr UInt32 kMaxQueuedFrames = 2048;
 constexpr UInt32 kDefaultBufferFrames = 128;
 constexpr UInt32 kZeroTimestampPeriodFrames = 16384;
 constexpr int64_t kTargetRecoveryDelayNanos = 1000000000;
+constexpr int64_t kMaxTargetRecoveryDelayNanos = 30000000000;
 constexpr int64_t kTargetIdleStopDelayNanos = 2000000000;
 constexpr int64_t kDefaultOutputRestoreDelayNanos = 250000000;
 constexpr UInt32 kDefaultOutputRestoreAttempts = 8;
@@ -83,6 +84,8 @@ std::atomic<UInt64> gTargetStartGeneration { 0 };
 std::atomic<UInt64> gTargetStopGeneration { 0 };
 std::atomic_bool gTargetActive { false };
 std::atomic_bool gTargetRecoveryScheduled { false };
+std::atomic<UInt32> gTargetRecoveryFailures { 0 };
+std::atomic<OSStatus> gTargetStartError { noErr };
 std::atomic<UInt64> gLastTargetIOHostTime { 0 };
 std::atomic<UInt32> gTargetBufferFrames { 0 };
 std::atomic<UInt32> gTargetIOFrames { 0 };
@@ -104,6 +107,7 @@ struct StateSnapshot {
     bool relayPriming;
     UInt32 targetBufferFrames;
     UInt32 targetIOFrames;
+    OSStatus targetStartError;
 };
 
 AudioObjectPropertyAddress MakeAddress(AudioObjectPropertySelector selector,
@@ -292,6 +296,8 @@ void FlushRingLocked(bool resetHealth = false) {
     if (resetHealth) {
         gDroppedFrames.store(0, std::memory_order_relaxed);
         gUnderruns.store(0, std::memory_order_relaxed);
+        gTargetStartError.store(noErr, std::memory_order_release);
+        gTargetRecoveryFailures.store(0, std::memory_order_release);
     }
     ReanchorTimelineLocked();
 }
@@ -328,10 +334,24 @@ UInt32 PrebufferFramesFor(UInt32 requestedFrames) {
 
 void ScheduleTargetRecovery();
 
+int64_t TargetRecoveryDelayNanos() {
+    UInt32 failures = gTargetRecoveryFailures.load(std::memory_order_acquire);
+    if (failures == 0) {
+        return kTargetRecoveryDelayNanos;
+    }
+    UInt32 shift = std::min<UInt32>(failures, 5);
+    int64_t delay = kTargetRecoveryDelayNanos << shift;
+    return std::min<int64_t>(delay, kMaxTargetRecoveryDelayNanos);
+}
+
 bool TargetNeedsRecovery() {
     if (!gTargetAvailable.load(std::memory_order_acquire) ||
         gRunningClients.load(std::memory_order_acquire) == 0) {
         return false;
+    }
+
+    if (!gTargetActive.load(std::memory_order_acquire)) {
+        return gTargetStartError.load(std::memory_order_acquire) != noErr;
     }
 
     UInt64 lastTargetIOHostTime = gLastTargetIOHostTime.load(std::memory_order_acquire);
@@ -726,12 +746,38 @@ void StartTargetDevice() {
     UInt32 targetBufferFrames = DeviceBufferFrameSize(target);
 
     AudioDeviceIOProcID ioProcID = nullptr;
-    if (AudioDeviceCreateIOProcID(target, TargetDeviceIOProc, nullptr, &ioProcID) != noErr) {
+    OSStatus createStatus = AudioDeviceCreateIOProcID(target, TargetDeviceIOProc, nullptr, &ioProcID);
+    if (createStatus != noErr) {
+        gTargetStartError.store(createStatus, std::memory_order_release);
+        gTargetRecoveryFailures.fetch_add(1, std::memory_order_acq_rel);
+        os_log_error(
+            OS_LOG_DEFAULT,
+            "MDV AudioDeviceCreateIOProcID failed for target=%u status=%d",
+            target,
+            static_cast<int>(createStatus)
+        );
+        Notify(kObjectIDBox, kPropertyStatus);
+        if (gDevicePublished.load(std::memory_order_acquire)) {
+            Notify(kObjectIDDevice, kPropertyStatus);
+        }
         return;
     }
 
-    if (AudioDeviceStart(target, ioProcID) != noErr) {
+    OSStatus startStatus = AudioDeviceStart(target, ioProcID);
+    if (startStatus != noErr) {
         AudioDeviceDestroyIOProcID(target, ioProcID);
+        gTargetStartError.store(startStatus, std::memory_order_release);
+        gTargetRecoveryFailures.fetch_add(1, std::memory_order_acq_rel);
+        os_log_error(
+            OS_LOG_DEFAULT,
+            "MDV AudioDeviceStart failed for target=%u status=%d",
+            target,
+            static_cast<int>(startStatus)
+        );
+        Notify(kObjectIDBox, kPropertyStatus);
+        if (gDevicePublished.load(std::memory_order_acquire)) {
+            Notify(kObjectIDDevice, kPropertyStatus);
+        }
         return;
     }
 
@@ -744,6 +790,8 @@ void StartTargetDevice() {
             gLastTargetIOHostTime.store(AudioGetCurrentHostTime(), std::memory_order_release);
             gTargetBufferFrames.store(targetBufferFrames, std::memory_order_release);
             gTargetIOFrames.store(0, std::memory_order_release);
+            gTargetStartError.store(noErr, std::memory_order_release);
+            gTargetRecoveryFailures.store(0, std::memory_order_release);
             gTargetActive.store(true, std::memory_order_release);
         } else {
             shouldStop = true;
@@ -752,6 +800,11 @@ void StartTargetDevice() {
     if (shouldStop) {
         AudioDeviceStop(target, ioProcID);
         AudioDeviceDestroyIOProcID(target, ioProcID);
+    } else {
+        Notify(kObjectIDBox, kPropertyStatus);
+        if (gDevicePublished.load(std::memory_order_acquire)) {
+            Notify(kObjectIDDevice, kPropertyStatus);
+        }
     }
 }
 
@@ -886,6 +939,8 @@ void SetTargetAvailability(bool available) {
     if (wasAvailable == available) {
         return;
     }
+    gTargetStartError.store(noErr, std::memory_order_release);
+    gTargetRecoveryFailures.store(0, std::memory_order_release);
     UpdateDevicePublication(!available);
     Notify(kObjectIDBox, kPropertyStatus);
     if (gDevicePublished.load(std::memory_order_acquire)) {
@@ -962,7 +1017,8 @@ void ScheduleTargetRecovery() {
         return;
     }
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kTargetRecoveryDelayNanos), gTargetQueue, ^{
+    int64_t delayNanos = TargetRecoveryDelayNanos();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNanos), gTargetQueue, ^{
         gTargetRecoveryScheduled.store(false, std::memory_order_release);
         if (!TargetNeedsRecovery()) {
             return;
@@ -992,6 +1048,7 @@ StateSnapshot SnapshotLocked() {
         gRelayPriming.load(std::memory_order_acquire),
         gTargetBufferFrames.load(std::memory_order_acquire),
         gTargetIOFrames.load(std::memory_order_acquire),
+        gTargetStartError.load(std::memory_order_acquire),
     };
 }
 
@@ -1005,7 +1062,7 @@ CFStringRef CopyStatusString() {
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "running=%u,target=%s,available=%s,published=%s,restoreDefault=%s,priming=%s,queuedFrames=%u,queuedMS=%.2f,bufferFrames=%u,targetBufferFrames=%u,targetBufferMS=%.2f,targetIOFrames=%u,targetIOMS=%.2f,dropped=%llu,underruns=%llu,sampleRate=%.0f",
+        "running=%u,target=%s,available=%s,published=%s,restoreDefault=%s,priming=%s,queuedFrames=%u,queuedMS=%.2f,bufferFrames=%u,targetBufferFrames=%u,targetBufferMS=%.2f,targetIOFrames=%u,targetIOMS=%.2f,dropped=%llu,underruns=%llu,sampleRate=%.0f,targetStartError=%d",
         gRunningClients.load(std::memory_order_acquire),
         snapshot.targetAlive ? "yes" : "no",
         snapshot.targetAvailable ? "yes" : "no",
@@ -1021,7 +1078,8 @@ CFStringRef CopyStatusString() {
         targetIOMS,
         snapshot.droppedFrames,
         snapshot.underruns,
-        snapshot.sampleRate
+        snapshot.sampleRate,
+        static_cast<int>(snapshot.targetStartError)
     );
     return CFStringCreateWithCString(nullptr, buffer, kCFStringEncodingUTF8);
 }
@@ -1992,6 +2050,8 @@ OSStatus SetPropertyData(AudioServerPlugInDriverRef driver,
                 }
                 gTargetUID = newUID != nullptr ? CFStringCreateCopy(nullptr, newUID) : nullptr;
                 uidToSave = gTargetUID != nullptr ? CFStringCreateCopy(nullptr, gTargetUID) : nullptr;
+                gTargetStartError.store(noErr, std::memory_order_release);
+                gTargetRecoveryFailures.store(0, std::memory_order_release);
                 FlushRingLocked();
             }
             SaveTargetUID(uidToSave);
@@ -2180,6 +2240,7 @@ OSStatus StartIO(AudioServerPlugInDriverRef driver, AudioObjectID deviceID, UInt
         gRunningClients.store(runningClients, std::memory_order_release);
         if (runningClients == 1) {
             CancelScheduledTargetStop();
+            gTargetRecoveryFailures.store(0, std::memory_order_release);
             FlushRingLocked();
             shouldStartTarget = !gTargetActive.load(std::memory_order_acquire);
         }
